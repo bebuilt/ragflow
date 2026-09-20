@@ -115,8 +115,13 @@ COMPOSE=(docker compose -p "$PROJECT" -f docker-compose.yml -f "$HERE/compose.be
 "${COMPOSE[@]}" up -d --remove-orphans
 
 log "compose: nothing published beyond loopback"
-OPEN="$(docker ps --format '{{.Names}} {{.Ports}}' | grep -E '(0\.0\.0\.0|\[::\]|:::)[0-9]*:' || true)"
+# Our own stack only. A box can carry a neighbour through a migration — LaborTech's ran Onyx on :80/:443
+# while RAGFlow was built beside it — and stopping on the neighbour's ports blocks the very migration
+# that removes them. Ours must still publish nothing outside 127.0.0.1: everything arrives by tunnel.
+OPEN="$(docker ps --filter "label=com.docker.compose.project=$PROJECT" --format '{{.Names}} {{.Ports}}' | grep -E '(0\.0\.0\.0|\[::\]|:::)[0-9]*:' || true)"
 [ -z "$OPEN" ] || die "a container publishes a port on a public interface: $OPEN"
+FOREIGN="$(docker ps --format '{{.Label "com.docker.compose.project"}} {{.Names}} {{.Ports}}' | grep -vE "^$PROJECT " | grep -E '(0\.0\.0\.0|\[::\]|:::)[0-9]*:' || true)"
+[ -z "$FOREIGN" ] || log "note: another stack on this box publishes public ports: $FOREIGN"
 
 if [ -f "$TOKEN" ]; then
   if ! systemctl is-enabled cloudflared >/dev/null 2>&1; then
