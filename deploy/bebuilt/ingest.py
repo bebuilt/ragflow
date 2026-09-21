@@ -151,7 +151,10 @@ def drive_walk(cx, account_id, root):
         folder = queue.pop(0)
         token = None
         while True:
-            args = {"folder_id": folder, "q": "trashed = false", "pageSize": 1000, "fields": fields}
+            # supportsAllDrives/includeItemsFromAllDrives: without them Drive silently omits anything in a
+            # shared drive, including a folder another company shared with this person (Molzer, 2026-09-21).
+            args = {"folder_id": folder, "q": "trashed = false", "pageSize": 1000, "fields": fields,
+                    "supportsAllDrives": True, "includeItemsFromAllDrives": True}
             if token:
                 args["pageToken"] = token
             page = cx.run(account_id, "GOOGLEDRIVE_FIND_FILE", args)
