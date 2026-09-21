@@ -8,9 +8,12 @@ Config, all this client's own (the box leaves our hands; nothing here reaches an
     /etc/bebuilt/ragflow-tenant.json  api_key, dataset_id (written by tenant-setup.py)
 
 A pass:
-  1. plan   walk every confirmed folder of every connected store, upsert what is there into `documents`;
-            a new file or a moved revision becomes `pending`; a file gone from a COMPLETE walk is removed
-            from RAGFlow. An incomplete or failed walk never removes anything.
+  1. plan   what the confirmed selection holds now. Once a day (and whenever the ticked folders change) it
+            walks every folder in full: a new file or a moved revision becomes `pending`, and a file gone
+            from a COMPLETE walk is removed from RAGFlow. An incomplete or failed walk never removes
+            anything. Every pass in between asks Drive what CHANGED since the last one, which is one or two
+            calls whatever the size of the selection — a 1,300-folder selection walked every five minutes
+            would be ~374,000 Composio calls a day (Molzer, 2026-09-21).
   2. send   pending → download through Composio (Google Docs/Sheets/Slides exported to Office formats) →
             upload to RAGFlow, tag with its source, start parsing. The old copy goes first on a revision move.
   0. reconcile  our records against everything RAGFlow holds: orphans deleted, finished parses indexed,
@@ -36,6 +39,12 @@ MAX_ATTEMPTS = 3
 # left five files RUNNING at 80% for hours with nothing working on them, and RAGFlow never retries those itself.
 STALL_SECONDS = 30 * 60
 PROGRESS_FILE = "/var/lib/bebuilt/ingest-progress.json"  # {ragflow_doc_id: {"mark", "since"}} between passes
+# Re-listing every folder each pass costs one call per folder: fine for ten folders, 1,300 calls a pass for a
+# real client selection (Molzer, 2026-09-21). Between full walks the pass asks Drive what CHANGED instead,
+# which is one or two calls however large the selection. The full walk still runs daily as the backstop for
+# anything the changes feed does not carry.
+SYNC_FILE = "/var/lib/bebuilt/drive-sync.json"  # {"<corpus>:<provider>": {token, folders, roots, walked_at}}
+FULL_WALK_SECONDS = 24 * 60 * 60
 
 FOLDER = "application/vnd.google-apps.folder"
 SHORTCUT = "application/vnd.google-apps.shortcut"
@@ -144,8 +153,9 @@ class RAGFlow:
 # --- Google Drive -------------------------------------------------------------------------------------
 
 def drive_walk(cx, account_id, root):
-    """Every file under `root` (breadth-first, paged). Returns (files, complete)."""
+    """Every file under `root` (breadth-first, paged). Returns (files, folders, complete)."""
     seen, files, queue, complete = {root}, {}, [root], True
+    folders = {root}
     fields = "nextPageToken,incompleteSearch,files(id,name,mimeType,size,modifiedTime,version,webViewLink,shortcutDetails)"
     while queue:
         folder = queue.pop(0)
@@ -165,12 +175,36 @@ def drive_walk(cx, account_id, root):
                 seen.add(f["id"])
                 if f["mimeType"] == FOLDER:
                     queue.append(f["id"])
+                    folders.add(f["id"])
                 elif f["mimeType"] != SHORTCUT and not f.get("shortcutDetails"):
                     files[f["id"]] = f
             token = page.get("nextPageToken")
             if not token:
                 break
-    return files, complete
+    return files, folders, complete
+
+
+def drive_start_token(cx, account_id):
+    """Drive's bookmark for 'changes from here on'. Taken before a walk, so nothing during it is missed."""
+    d = cx.run(account_id, "GOOGLEDRIVE_GET_CHANGES_START_PAGE_TOKEN", {"supportsAllDrives": True})
+    return d.get("startPageToken") or d.get("start_page_token")
+
+
+def drive_changes(cx, account_id, token):
+    """(changes, next token) for everything this account can see that changed since `token`."""
+    fields = ("nextPageToken,newStartPageToken,changes(removed,fileId,file(id,name,mimeType,size,modifiedTime,"
+              "version,webViewLink,parents,trashed,shortcutDetails))")
+    changes = []
+    while True:
+        page = cx.run(account_id, "GOOGLEDRIVE_LIST_CHANGES", {
+            "pageToken": token, "pageSize": 1000, "fields": fields, "includeRemoved": True,
+            "includeItemsFromAllDrives": True, "supportsAllDrives": True, "restrictToMyDrive": False, "spaces": "drive",
+        })
+        changes += page.get("changes") or []
+        nxt = page.get("nextPageToken")
+        if not nxt:
+            return changes, page.get("newStartPageToken") or token
+        token = nxt
 
 
 def drive_download(cx, account_id, f):
@@ -208,61 +242,175 @@ def indexable(mime, size):
 
 # --- the pass -----------------------------------------------------------------------------------------
 
+def upsert_file(db, org, corpus, provider, f):
+    """One Drive file into `documents`: new work becomes pending, a moved revision re-queues, a kind we
+    cannot read is recorded as skipped so the screens can say why."""
+    size = int(f["size"]) if f.get("size") else None
+    revision = str(f.get("version") or f.get("modifiedTime") or "")
+    why_not = indexable(f["mimeType"], size)
+    db.execute(
+        """insert into documents (org_id, corpus_id, provider, external_id, name, mime_type, size, web_url,
+                                  source_revision, state, last_error, seen_at, updated_at)
+           values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())
+           on conflict (corpus_id, provider, external_id) do update set
+             name = excluded.name, mime_type = excluded.mime_type, size = excluded.size,
+             web_url = excluded.web_url, source_revision = excluded.source_revision, seen_at = now(),
+             state = case
+               when excluded.state = 'skipped' then 'skipped'
+               when documents.state = 'removed' then 'pending'
+               when documents.indexed_revision is distinct from excluded.source_revision
+                    and documents.state in ('indexed', 'skipped') then 'pending'
+               when documents.state = 'failed' and documents.source_revision is distinct from excluded.source_revision then 'pending'
+               when documents.state = 'failed' and documents.attempts < 3 then 'pending'
+               else documents.state end,
+             attempts = case when documents.source_revision is distinct from excluded.source_revision then 0 else documents.attempts end,
+             last_error = case when excluded.state = 'skipped' then excluded.last_error else documents.last_error end,
+             updated_at = now()""",
+        (org, corpus, provider, f["id"], f["name"], f["mimeType"], size, f.get("webViewLink"), revision,
+         "skipped" if why_not else "pending", why_not))
+
+
+def drop_file(db, org, corpus, provider, external_id):
+    """A file that left the selection: out of RAGFlow, marked removed here. 1 if we held it, else 0."""
+    row = db.execute("select id, ragflow_doc_id from documents where org_id = %s and corpus_id = %s and provider = %s "
+                     "and external_id = %s and state <> 'removed'", (org, corpus, provider, external_id)).fetchone()
+    if not row:
+        return 0
+    doc_id, rf = row
+    if rf:
+        rag.delete([rf])
+    db.execute("update documents set state = 'removed', ragflow_doc_id = null, indexed_revision = null, updated_at = now() where id = %s", (doc_id,))
+    return 1
+
+
+def load_sync():
+    try:
+        return json.load(open(SYNC_FILE))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_sync(state):
+    os.makedirs(os.path.dirname(SYNC_FILE), exist_ok=True)
+    tmp = SYNC_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, SYNC_FILE)
+
+
+def full_walk(db, cx, org, corpus, provider, account, roots):
+    """Every confirmed folder, listed in full. Removals happen only from a COMPLETE walk (D32): a partial
+    listing once sent 39 live files back for re-upload. Returns the sync state for later passes."""
+    files, folders, complete = {}, set(), True
+    token = None
+    try:  # the bookmark is taken BEFORE the walk, so a change during it is caught by the next pass
+        token = drive_start_token(cx, account)
+    except Exception as e:
+        log(f"plan: no changes bookmark ({e}); next pass walks in full again")
+    for root in roots:
+        try:
+            got, walked, ok = drive_walk(cx, account, root)
+        except Exception as e:  # a failed walk removes nothing
+            log(f"plan: walking {provider}:{root} failed: {e}")
+            got, walked, ok = {}, set(), False
+        files.update(got)
+        folders |= walked
+        complete = complete and ok
+    for f in files.values():
+        upsert_file(db, org, corpus, provider, f)
+    if complete:
+        gone = db.execute(
+            "select external_id from documents where org_id = %s and corpus_id = %s and provider = %s "
+            "and state <> 'removed' and not (external_id = any(%s::text[]))", (org, corpus, provider, list(files))).fetchall()
+        for (external_id,) in gone:
+            drop_file(db, org, corpus, provider, external_id)
+        if gone:
+            log(f"plan: removed {len(gone)} file(s) no longer in the selection")
+    else:
+        log(f"plan: {provider} walk incomplete; nothing removed this pass")
+    log(f"plan: walked {len(folders)} folder(s), {len(files)} file(s)")
+    if not (complete and token):
+        return None
+    return {"token": token, "folders": sorted(folders), "roots": sorted(roots), "walked_at": time.time()}
+
+
+def incremental(db, cx, org, corpus, provider, account, saved):
+    """What changed since the last pass, in one or two calls. False if the feed could not be read, which
+    sends this pass back to a full walk."""
+    try:
+        changes, token = drive_changes(cx, account, saved["token"])
+    except Exception as e:
+        log(f"plan: changes feed failed ({e})")
+        return False
+    folders = set(saved["folders"])
+    fresh, touched = [], 0
+    for ch in changes:
+        f = ch.get("file") or {}
+        external_id = ch.get("fileId") or f.get("id")
+        if not external_id:
+            continue
+        if ch.get("removed") or f.get("trashed"):
+            touched += drop_file(db, org, corpus, provider, external_id)
+            continue
+        parents = f.get("parents") or []
+        inside = any(p in folders for p in parents)
+        if f.get("mimeType") == FOLDER:
+            if inside and external_id not in folders:
+                fresh.append(external_id)  # walked below, so the files already in it arrive too
+            continue
+        if f.get("mimeType") == SHORTCUT or f.get("shortcutDetails"):
+            continue
+        if inside:
+            upsert_file(db, org, corpus, provider, f)
+            touched += 1
+        elif parents:  # moved out of every ticked folder
+            touched += drop_file(db, org, corpus, provider, external_id)
+    for folder in fresh:
+        try:
+            got, walked, _ = drive_walk(cx, account, folder)
+        except Exception as e:
+            log(f"plan: walking new folder {folder} failed: {e}")
+            continue
+        folders |= walked
+        for f in got.values():
+            upsert_file(db, org, corpus, provider, f)
+        touched += len(got)
+    saved["token"] = token
+    saved["folders"] = sorted(folders)
+    if changes:
+        log(f"plan: {len(changes)} change(s), {len(fresh)} new folder(s), {touched} file(s) touched")
+    return True
+
+
 def plan(db, cx, org):
     sources = db.execute(
         "select s.corpus_id, s.provider, s.external_id, c.composio_connected_account_id "
         "from corpus_sources s join corpus_connections c on c.corpus_id = s.corpus_id and c.provider = s.provider "
         "where s.org_id = %s and s.confirmed_at is not null and c.status = 'ACTIVE'", (org,)).fetchall()
-    walked = {}  # (corpus, provider) -> (files, complete)
+    selections = {}  # (corpus, provider) -> {account, roots}
     for corpus, provider, root, account in sources:
         if provider != "googledrive":
             log(f"plan: no ingestion adapter for {provider} yet; skipping {root}")
             continue
-        try:
-            files, complete = drive_walk(cx, account, root)
-        except Exception as e:  # a failed walk removes nothing
-            log(f"plan: walking {provider}:{root} failed: {e}")
-            files, complete = {}, False
-        prev = walked.get((corpus, provider), ({}, True))
-        walked[(corpus, provider)] = ({**prev[0], **files}, prev[1] and complete)
+        entry = selections.setdefault((corpus, provider), {"account": account, "roots": []})
+        entry["roots"].append(root)
 
-    for (corpus, provider), (files, complete) in walked.items():
-        for f in files.values():
-            size = int(f["size"]) if f.get("size") else None
-            revision = str(f.get("version") or f.get("modifiedTime") or "")
-            why_not = indexable(f["mimeType"], size)
-            db.execute(
-                """insert into documents (org_id, corpus_id, provider, external_id, name, mime_type, size, web_url,
-                                          source_revision, state, last_error, seen_at, updated_at)
-                   values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())
-                   on conflict (corpus_id, provider, external_id) do update set
-                     name = excluded.name, mime_type = excluded.mime_type, size = excluded.size,
-                     web_url = excluded.web_url, source_revision = excluded.source_revision, seen_at = now(),
-                     state = case
-                       when excluded.state = 'skipped' then 'skipped'
-                       when documents.state = 'removed' then 'pending'
-                       when documents.indexed_revision is distinct from excluded.source_revision
-                            and documents.state in ('indexed', 'skipped') then 'pending'
-                       when documents.state = 'failed' and documents.source_revision is distinct from excluded.source_revision then 'pending'
-                       when documents.state = 'failed' and documents.attempts < 3 then 'pending'
-                       else documents.state end,
-                     attempts = case when documents.source_revision is distinct from excluded.source_revision then 0 else documents.attempts end,
-                     last_error = case when excluded.state = 'skipped' then excluded.last_error else documents.last_error end,
-                     updated_at = now()""",
-                (org, corpus, provider, f["id"], f["name"], f["mimeType"], size, f.get("webViewLink"), revision,
-                 "skipped" if why_not else "pending", why_not))
-        if complete:
-            gone = db.execute(
-                "select id, ragflow_doc_id from documents where org_id = %s and corpus_id = %s and provider = %s "
-                "and state <> 'removed' and not (external_id = any(%s::text[]))", (org, corpus, provider, list(files))).fetchall()
-            for doc_id, rf in gone:
-                if rf:
-                    rag.delete([rf])
-                db.execute("update documents set state = 'removed', ragflow_doc_id = null, indexed_revision = null, updated_at = now() where id = %s", (doc_id,))
-            if gone:
-                log(f"plan: removed {len(gone)} file(s) no longer in the selection")
+    state = load_sync()
+    for (corpus, provider), entry in selections.items():
+        key = f"{corpus}:{provider}"
+        saved = state.get(key) or {}
+        # A full walk when there is nothing to go on, when the ticked folders change, or once a day.
+        usable = saved.get("token") and saved.get("folders") and saved.get("roots") == sorted(entry["roots"])
+        due = time.time() - (saved.get("walked_at") or 0) > FULL_WALK_SECONDS
+        if usable and not due and incremental(db, cx, org, corpus, provider, entry["account"], saved):
+            state[key] = saved
         else:
-            log(f"plan: {provider} walk incomplete; nothing removed this pass")
+            fresh = full_walk(db, cx, org, corpus, provider, entry["account"], entry["roots"])
+            if fresh:
+                state[key] = fresh
+            else:
+                state.pop(key, None)
+    save_sync({k: v for k, v in state.items() if f"{k}" in {f"{c}:{p}" for c, p in selections}})
     db.commit()
 
 
