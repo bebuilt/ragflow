@@ -40,12 +40,12 @@ import requests
 RAGFLOW = "http://127.0.0.1:8080/api/v1"
 COMPOSIO = "https://backend.composio.dev/api/v3.1"
 DRIVE_TOOLS_VERSION = "20260915_00"  # keep in step with bebuilt-app src/lib/storage/googledrive.ts
-BATCH = 25  # files sent per pass
-# RAGFlow parses far slower than we can upload, so an unthrottled worker buries it: Molzer's queue reached
-# 2,337 entries (2026-09-21), which made the priority order meaningless — everything marked first still sat
-# behind hours of work — and left the executor grinding through phantom entries after a cancel. A pass sends
-# nothing while RAGFlow still has this many documents in hand.
-QUEUE_HIGH = 40
+BATCH = 100  # files sent per pass
+# Keep RAGFlow fed but never buried. Sending everything at once made Molzer's queue 2,337 deep, which made
+# the priority order meaningless and left the executor grinding phantom entries after a cancel; sending 25 a
+# pass then starved a box that had become fast (0.8% CPU with 5,900 files waiting, 2026-09-21). So a pass
+# sends up to BATCH files, and sends nothing at all while RAGFlow still holds QUEUE_HIGH of them.
+QUEUE_HIGH = 60
 MAX_BYTES = 100 * 1024 * 1024
 MAX_ATTEMPTS = 3
 # RAGFlow runs its vision pipeline (layout detection and OCR, ~6 s a page) over every PDF page, even pages
