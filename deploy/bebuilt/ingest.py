@@ -43,6 +43,13 @@ DRIVE_TOOLS_VERSION = "20260915_00"  # keep in step with bebuilt-app src/lib/sto
 BATCH = 25  # files sent per pass
 MAX_BYTES = 100 * 1024 * 1024
 MAX_ATTEMPTS = 3
+# RAGFlow runs its vision pipeline (layout detection and OCR, ~6 s a page) over every PDF page, even pages
+# whose text is already in the file. Half a real client's PDFs have a text layer (Molzer, 2026-09-21), and
+# reading it takes milliseconds. So every PDF is parsed as plain text first; one that comes back with nothing
+# is a scan, and only those are sent back through OCR. The choice is recorded on the RAGFlow document, so a
+# pass can tell a scan it has already escalated from one it has not.
+PLAIN = {"layout_recognize": "Plain Text"}
+OCR = {"layout_recognize": "DeepDOC"}
 # A parse whose progress has not moved in this long is stalled, not slow: a RAGFlow restart mid-embed (2026-09-18)
 # left five files RUNNING at 80% for hours with nothing working on them, and RAGFlow never retries those itself.
 STALL_SECONDS = 30 * 60
@@ -134,6 +141,9 @@ class RAGFlow:
 
     def tag(self, doc_id, meta):
         self._ok(self.s.patch(f"{RAGFLOW}/datasets/{self.ds}/documents/{doc_id}", json={"meta_fields": meta}, timeout=60))
+
+    def configure(self, doc_id, parser_config):
+        self._ok(self.s.put(f"{RAGFLOW}/datasets/{self.ds}/documents/{doc_id}", json={"parser_config": parser_config}, timeout=60))
 
     def parse(self, doc_ids):
         self._ok(self.s.post(f"{RAGFLOW}/datasets/{self.ds}/chunks", json={"document_ids": doc_ids}, timeout=60))
@@ -550,7 +560,11 @@ def send(db, cx, org):
             if old_rf:
                 rag.delete([old_rf])
             rf = rag.upload(filename, content)
-            rag.tag(rf, {"provider": provider, "external_id": ext_id, "revision": revision, "web_url": web_url or ""})
+            plain = mime == "application/pdf"
+            if plain:
+                rag.configure(rf, PLAIN)
+            rag.tag(rf, {"provider": provider, "external_id": ext_id, "revision": revision, "web_url": web_url or "",
+                         "parse": "plain" if plain else "native"})
             db.execute("update documents set state = 'parsing', ragflow_doc_id = %s, sent_revision = %s, last_error = null, updated_at = now() where id = %s",
                        (rf, revision, doc_id))
             started.append(rf)
@@ -576,7 +590,7 @@ def reconcile(db, org):
     except Exception as e:
         log(f"reconcile: skipped, {e}")
         return
-    rows = db.execute("select id, name, state, ragflow_doc_id, sent_revision, source_revision from documents "
+    rows = db.execute("select id, name, state, ragflow_doc_id, sent_revision, source_revision, mime_type from documents "
                       "where org_id = %s and ragflow_doc_id is not null", (org,)).fetchall()
     marks, now = load_progress(), time.time()
     running = set()
@@ -584,7 +598,8 @@ def reconcile(db, org):
     if orphans:
         rag.delete(orphans)
         log(f"reconcile: deleted {len(orphans)} RAGFlow document(s) no record refers to")
-    for doc_id, name, state, rf, sent, current in rows:
+    escalated = 0
+    for doc_id, name, state, rf, sent, current, mime in rows:
         d = held.get(rf)
         if d is None:
             db.execute("update documents set state = 'pending', ragflow_doc_id = null, last_error = 'gone from RAGFlow', updated_at = now() "
@@ -593,6 +608,17 @@ def reconcile(db, org):
         if state != "parsing":
             continue
         run = str(d.get("run"))
+        meta = d.get("meta_fields") or {}
+        if run in ("DONE", "3") and mime == "application/pdf" and not d.get("chunk_count") and meta.get("parse") == "plain":
+            # Nothing came out of the text layer: this one really is a scan, so it earns the slow parser.
+            try:
+                rag.configure(rf, OCR)
+                rag.tag(rf, {**meta, "parse": "ocr"})
+                rag.parse([rf])
+                escalated += 1
+            except Exception as e:
+                log(f"reconcile: sending {name} to OCR failed: {e}")
+            continue
         if run in ("DONE", "3"):
             # Recorded against what was sent; if the file moved on meanwhile, it goes straight back to pending.
             db.execute("update documents set state = %s, indexed_revision = %s, chunk_count = %s, last_error = null, updated_at = now() where id = %s",
@@ -616,6 +642,8 @@ def reconcile(db, org):
                 log(f"reconcile: {name} stalled; sent back to be retried")
             else:
                 running.add(rf)
+    if escalated:
+        log(f"reconcile: {escalated} scanned PDF(s) sent through OCR")
     db.commit()
     save_progress({rf: m for rf, m in marks.items() if rf in running})
 
