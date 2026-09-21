@@ -44,7 +44,10 @@ PROGRESS_FILE = "/var/lib/bebuilt/ingest-progress.json"  # {ragflow_doc_id: {"ma
 # which is one or two calls however large the selection. The full walk still runs daily as the backstop for
 # anything the changes feed does not carry.
 SYNC_FILE = "/var/lib/bebuilt/drive-sync.json"  # {"<corpus>:<provider>": {token, folders, roots, walked_at}}
-FULL_WALK_SECONDS = 24 * 60 * 60
+# Weekly (Brandon, 2026-09-21). The walk is no longer how changes are noticed, only the backstop for what the
+# feed might not carry — so every walk counts what the feed never reported (`missed`) into `ingest_runs`, and
+# the health check alerts on it. Zero for a few weeks is the evidence for dropping it further.
+FULL_WALK_SECONDS = 7 * 24 * 60 * 60
 
 FOLDER = "application/vnd.google-apps.folder"
 SHORTCUT = "application/vnd.google-apps.shortcut"
@@ -298,9 +301,9 @@ def save_sync(state):
     os.replace(tmp, SYNC_FILE)
 
 
-def full_walk(db, cx, org, corpus, provider, account, roots):
+def full_walk(db, cx, org, corpus, provider, account, roots, count_missed=False):
     """Every confirmed folder, listed in full. Removals happen only from a COMPLETE walk (D32): a partial
-    listing once sent 39 live files back for re-upload. Returns the sync state for later passes."""
+    listing once sent 39 live files back for re-upload. Returns (sync state, files, folders, missed)."""
     files, folders, complete = {}, set(), True
     token = None
     try:  # the bookmark is taken BEFORE the walk, so a change during it is caught by the next pass
@@ -316,6 +319,17 @@ def full_walk(db, cx, org, corpus, provider, account, roots):
         files.update(got)
         folders |= walked
         complete = complete and ok
+    # What the changes feed should already have brought us: anything here that we do not hold at this
+    # revision was missed (only meaningful when a feed was running, not on a first walk).
+    missed = 0
+    if count_missed and files:
+        held = dict(db.execute(
+            "select external_id, source_revision from documents where org_id = %s and corpus_id = %s and provider = %s "
+            "and state <> 'removed' and external_id = any(%s::text[])", (org, corpus, provider, list(files))).fetchall())
+        for external_id, f in files.items():
+            revision = str(f.get("version") or f.get("modifiedTime") or "")
+            if held.get(external_id) != revision:
+                missed += 1
     for f in files.values():
         upsert_file(db, org, corpus, provider, f)
     if complete:
@@ -328,10 +342,9 @@ def full_walk(db, cx, org, corpus, provider, account, roots):
             log(f"plan: removed {len(gone)} file(s) no longer in the selection")
     else:
         log(f"plan: {provider} walk incomplete; nothing removed this pass")
-    log(f"plan: walked {len(folders)} folder(s), {len(files)} file(s)")
-    if not (complete and token):
-        return None
-    return {"token": token, "folders": sorted(folders), "roots": sorted(roots), "walked_at": time.time()}
+    log(f"plan: walked {len(folders)} folder(s), {len(files)} file(s)" + (f", {missed} missed by the changes feed" if count_missed else ""))
+    state = {"token": token, "folders": sorted(folders), "roots": sorted(roots), "walked_at": time.time()} if complete and token else None
+    return state, len(files), len(folders), missed
 
 
 def incremental(db, cx, org, corpus, provider, account, saved):
@@ -396,6 +409,7 @@ def plan(db, cx, org):
         entry["roots"].append(root)
 
     state = load_sync()
+    ran = []
     for (corpus, provider), entry in selections.items():
         key = f"{corpus}:{provider}"
         saved = state.get(key) or {}
@@ -404,13 +418,21 @@ def plan(db, cx, org):
         due = time.time() - (saved.get("walked_at") or 0) > FULL_WALK_SECONDS
         if usable and not due and incremental(db, cx, org, corpus, provider, entry["account"], saved):
             state[key] = saved
+            ran.append(("changes", 0, 0, 0))
         else:
-            fresh = full_walk(db, cx, org, corpus, provider, entry["account"], entry["roots"])
+            fresh, files, folders, missed = full_walk(db, cx, org, corpus, provider, entry["account"], entry["roots"], count_missed=usable)
+            ran.append(("walk", folders, files, missed))
             if fresh:
                 state[key] = fresh
             else:
                 state.pop(key, None)
-    save_sync({k: v for k, v in state.items() if f"{k}" in {f"{c}:{p}" for c, p in selections}})
+    save_sync({k: v for k, v in state.items() if k in {f"{c}:{p}" for c, p in selections}})
+    # The worker's heartbeat: a pass that changes nothing still proves the worker is alive, which document
+    # timestamps no longer can now that most passes write nothing.
+    if ran:
+        mode = "walk" if any(r[0] == "walk" for r in ran) else "changes"
+        db.execute("insert into ingest_runs (org_id, mode, folders, files, missed) values (%s, %s, %s, %s, %s)",
+                   (org, mode, sum(r[1] for r in ran), sum(r[2] for r in ran), sum(r[3] for r in ran)))
     db.commit()
 
 
