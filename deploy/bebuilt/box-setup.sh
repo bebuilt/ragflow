@@ -89,6 +89,12 @@ want = {}
 for layer in layers:
     # RAGFLOW_APP_* belong to tenant-setup.py alone; docker/.env reaches every container's environment.
     want.update((k, v) for k, v in pairs(layer) if not k.startswith("RAGFLOW_APP_"))
+# One field decides the model: the client's chosen embedding model ("BAAI/bge-small-en-v1.5@Builtin") is what
+# the dataset is created with AND what the embedding service loads, so the two can never drift apart. The
+# image ships Qwen/Qwen3-Embedding-0.6B, BAAI/bge-small-en-v1.5 and BAAI/bge-m3 under /data.
+chosen = want.get("RAGFLOW_EMBEDDING_MODEL")
+if chosen:
+    want["TEI_MODEL"] = chosen.split("@")[0]
 lines, seen = [], set()
 for line in open(base):
     m = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*=", line)
