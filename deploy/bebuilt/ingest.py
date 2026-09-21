@@ -442,7 +442,8 @@ def send(db, cx, org):
                   d.attempts, c.composio_connected_account_id
            from documents d join corpus_connections c on c.corpus_id = d.corpus_id and c.provider = d.provider
            where d.org_id = %s and d.state = 'pending' and c.status = 'ACTIVE'
-           order by d.updated_at limit %s""", (org, BATCH)).fetchall()
+           -- Documents an operator marked as wanted first (`npm run org -- priority`), then oldest waiting.
+           order by d.priority desc, d.updated_at limit %s""", (org, BATCH)).fetchall()
     started = []
     for doc_id, provider, ext_id, name, mime, web_url, revision, old_rf, attempts, account in rows:
         db.execute("update documents set state = 'uploading', updated_at = now() where id = %s", (doc_id,))
