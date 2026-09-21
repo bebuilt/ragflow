@@ -10,6 +10,7 @@ the only thing bebuilt adds to the fork; everything else tracks upstream.
 | `env.bebuilt` | Non-secret settings layered onto `docker/.env`: the image pinned by digest, OpenSearch, local embeddings, no self-registration. |
 | `tenant-setup.py` | Runs inside the RAGFlow container: this box's app user, its API key and the `shared` dataset (embedding model pinned; never changed once the dataset exists). Writes `/etc/bebuilt/ragflow-tenant.json`. |
 | `ingest.py` + `bebuilt-ingest.{service,timer}` | The ingestion worker, every five minutes: walks the confirmed selection through Composio, sends new and changed files to RAGFlow, records progress in the platform DB as `worker_<slug>` (RLS: this org's rows only). |
+| `test_ingest.py` | The worker's selection, ownership and removal logic against a throwaway Postgres and a fake Drive per person (see its header for the two commands). |
 | `ragflow-dump.sh` | Nightly consistent MySQL dump onto the box's own disk (keeps three), so each Hetzner backup holds a clean copy. |
 
 It is driven from the laptop by `scripts/ragflow-provision.sh <client> <host> [ref]` in
@@ -41,6 +42,16 @@ Rules this directory keeps:
 - **Settings reach a box through its tag**, like code: tag the change, then re-run
   `scripts/ragflow-provision.sh <client> <host>` (it checks out the tag and merges `env.bebuilt` into
   `docker/.env`). That restarts RAGFlow, so the rule above applies.
+- **A worker-only change needs no restart.** When a tag changes nothing outside `deploy/bebuilt/`, update with
+  `scripts/ragflow-worker-update.sh <client> <host> <ref>` (bebuilt-platform-v2): it stops the timer, lets a
+  running pass finish, checks the tag out without `--force` (the box's edited `docker/.env` is carried over)
+  and starts the timer again. RAGFlow's containers are never touched. It refuses a tag that changes anything
+  else; that goes through provisioning in a quiet window.
+- **Each person's Drive is its own connection** (from `.21.5`). Every member adds folders from their own Drive
+  into the one shared dataset, each connection under its own Composio identity (`corpus_connections.
+  composio_user_id`). A file two people can reach is one document, read through one connection. With more than
+  one connection in a store, nothing is removed except by a walk of every live connection that finds the file
+  under none of them; one person's changes feed saying a file left their view only schedules that walk.
 - **Failed for good is not stuck.** After three attempts a document is `failed` and the app stops counting it
   as work in progress; it is retried only when the file changes in the store. Re-queue it by hand
   (`pending`, `attempts = 0`) once the cause is fixed.

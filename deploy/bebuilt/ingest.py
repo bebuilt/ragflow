@@ -4,7 +4,15 @@
 
 Config, all this client's own (the box leaves our hands; nothing here reaches another client):
     /etc/bebuilt/worker.env         WORKER_DB_URL (worker_<slug>: RLS admits this org's rows only),
-                                    ORG_ID, COMPOSIO_API_KEY, COMPOSIO_USER_ID
+                                    ORG_ID, COMPOSIO_API_KEY, COMPOSIO_USER_ID (only for a connection that
+                                    records no identity of its own)
+
+Each person adds folders from their own Drive into the one shared index (2026-09-22), so a store can have several
+connections, each under its own Composio identity. Everything here is keyed by connection: its roots, its changes
+token, what it downloads. A file two people can reach is ONE document, owned by one connection (`documents.
+connection_id`); a live owner is kept, otherwise the document goes to a connection that sees it. With more than
+one connection, nothing is removed except by a pass that walks every live connection completely and finds the file
+under none of them; a document whose owner isn't live is left alone.
     /etc/bebuilt/ragflow-tenant.json  api_key, dataset_id (written by tenant-setup.py)
 
 A pass:
@@ -43,7 +51,7 @@ PROGRESS_FILE = "/var/lib/bebuilt/ingest-progress.json"  # {ragflow_doc_id: {"ma
 # real client selection (Molzer, 2026-09-21). Between full walks the pass asks Drive what CHANGED instead,
 # which is one or two calls however large the selection. The full walk still runs daily as the backstop for
 # anything the changes feed does not carry.
-SYNC_FILE = "/var/lib/bebuilt/drive-sync.json"  # {"<corpus>:<provider>": {token, folders, roots, walked_at}}
+SYNC_FILE = "/var/lib/bebuilt/drive-sync.json"  # {"<corpus>:<provider>:<connection>": {token, folders, roots, walked_at, walk?}}
 # Weekly (Brandon, 2026-09-21). The walk is no longer how changes are noticed, only the backstop for what the
 # feed might not carry — so every walk counts what the feed never reported (`missed`) into `ingest_runs`, and
 # the health check alerts on it. Zero for a few weeks is the evidence for dropping it further.
@@ -89,14 +97,16 @@ def load_env(path):
 
 
 class Composio:
-    def __init__(self, key, user_id):
+    def __init__(self, key, default_user=None):
         self.s = requests.Session()
         self.s.headers["x-api-key"] = key
-        self.user_id = user_id
+        self.default_user = default_user
 
-    def run(self, account_id, slug, args):
+    def run(self, acct, slug, args):
+        """`acct` is (Composio identity, connected account): each person's account lives under their own identity."""
+        user, account_id = acct
         r = self.s.post(f"{COMPOSIO}/tools/execute/{slug}", timeout=120, json={
-            "connected_account_id": account_id, "user_id": self.user_id, "version": DRIVE_TOOLS_VERSION, "arguments": args,
+            "connected_account_id": account_id, "user_id": user or self.default_user, "version": DRIVE_TOOLS_VERSION, "arguments": args,
         })
         r.raise_for_status()
         body = r.json()
@@ -155,7 +165,7 @@ class RAGFlow:
 
 # --- Google Drive -------------------------------------------------------------------------------------
 
-def drive_walk(cx, account_id, root):
+def drive_walk(cx, acct, root):
     """Every file under `root` (breadth-first, paged). Returns (files, folders, complete)."""
     seen, files, queue, complete = {root}, {}, [root], True
     folders = {root}
@@ -170,7 +180,7 @@ def drive_walk(cx, account_id, root):
                     "supportsAllDrives": True, "includeItemsFromAllDrives": True}
             if token:
                 args["pageToken"] = token
-            page = cx.run(account_id, "GOOGLEDRIVE_FIND_FILE", args)
+            page = cx.run(acct, "GOOGLEDRIVE_FIND_FILE", args)
             complete = complete and not page.get("incompleteSearch")
             for f in page.get("files") or []:
                 if f["id"] in seen:
@@ -187,19 +197,19 @@ def drive_walk(cx, account_id, root):
     return files, folders, complete
 
 
-def drive_start_token(cx, account_id):
+def drive_start_token(cx, acct):
     """Drive's bookmark for 'changes from here on'. Taken before a walk, so nothing during it is missed."""
-    d = cx.run(account_id, "GOOGLEDRIVE_GET_CHANGES_START_PAGE_TOKEN", {"supportsAllDrives": True})
+    d = cx.run(acct, "GOOGLEDRIVE_GET_CHANGES_START_PAGE_TOKEN", {"supportsAllDrives": True})
     return d.get("startPageToken") or d.get("start_page_token")
 
 
-def drive_changes(cx, account_id, token):
+def drive_changes(cx, acct, token):
     """(changes, next token) for everything this account can see that changed since `token`."""
     fields = ("nextPageToken,newStartPageToken,changes(removed,fileId,file(id,name,mimeType,size,modifiedTime,"
               "version,webViewLink,parents,trashed,shortcutDetails))")
     changes = []
     while True:
-        page = cx.run(account_id, "GOOGLEDRIVE_LIST_CHANGES", {
+        page = cx.run(acct, "GOOGLEDRIVE_LIST_CHANGES", {
             "pageToken": token, "pageSize": 1000, "fields": fields, "includeRemoved": True,
             "includeItemsFromAllDrives": True, "supportsAllDrives": True, "restrictToMyDrive": False, "spaces": "drive",
         })
@@ -210,17 +220,17 @@ def drive_changes(cx, account_id, token):
         token = nxt
 
 
-def drive_download(cx, account_id, f):
+def drive_download(cx, acct, f):
     """(filename, bytes) for a file RAGFlow can parse, or raise Skip."""
     mime = f["mimeType"]
     if mime in EXPORT:
         export_mime, ext = EXPORT[mime]
-        data = cx.run(account_id, "GOOGLEDRIVE_DOWNLOAD_FILE", {"fileId": f["external_id"], "mime_type": export_mime})
+        data = cx.run(acct, "GOOGLEDRIVE_DOWNLOAD_FILE", {"fileId": f["external_id"], "mime_type": export_mime})
         if data.get("export_size_limit_exceeded"):
             raise Skip("Google can export at most 10 MB of this file type")
     else:
         ext = INDEXED[mime]
-        data = cx.run(account_id, "GOOGLEDRIVE_DOWNLOAD_FILE", {"fileId": f["external_id"]})
+        data = cx.run(acct, "GOOGLEDRIVE_DOWNLOAD_FILE", {"fileId": f["external_id"]})
     content = data.get("downloaded_file_content") or {}
     url = content.get("s3url")
     if not url:
@@ -245,17 +255,21 @@ def indexable(mime, size):
 
 # --- the pass -----------------------------------------------------------------------------------------
 
-def upsert_file(db, org, corpus, provider, f):
+def upsert_file(db, org, corpus, provider, f, owner, keep=()):
     """One Drive file into `documents`: new work becomes pending, a moved revision re-queues, a kind we
-    cannot read is recorded as skipped so the screens can say why."""
+    cannot read is recorded as skipped so the screens can say why. `owner` is the connection it is read through;
+    an existing owner listed in `keep` (the live connections, from a changes feed) stays. A group walk passes no
+    `keep`, because it has already decided the owner."""
     size = int(f["size"]) if f.get("size") else None
     revision = str(f.get("version") or f.get("modifiedTime") or "")
     why_not = indexable(f["mimeType"], size)
     db.execute(
         """insert into documents (org_id, corpus_id, provider, external_id, name, mime_type, size, web_url,
-                                  source_revision, state, last_error, seen_at, updated_at)
-           values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())
+                                  source_revision, state, last_error, connection_id, seen_at, updated_at)
+           values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())
            on conflict (corpus_id, provider, external_id) do update set
+             connection_id = case when documents.connection_id = any(%s::uuid[]) then documents.connection_id
+                                  else excluded.connection_id end,
              name = excluded.name, mime_type = excluded.mime_type, size = excluded.size,
              web_url = excluded.web_url, source_revision = excluded.source_revision, seen_at = now(),
              state = case
@@ -270,7 +284,7 @@ def upsert_file(db, org, corpus, provider, f):
              last_error = case when excluded.state = 'skipped' then excluded.last_error else documents.last_error end,
              updated_at = now()""",
         (org, corpus, provider, f["id"], f["name"], f["mimeType"], size, f.get("webViewLink"), revision,
-         "skipped" if why_not else "pending", why_not))
+         "skipped" if why_not else "pending", why_not, owner, list(keep)))
 
 
 def drop_file(db, org, corpus, provider, external_id):
@@ -288,7 +302,8 @@ def drop_file(db, org, corpus, provider, external_id):
 
 def load_sync():
     try:
-        return json.load(open(SYNC_FILE))
+        with open(SYNC_FILE) as f:
+            return json.load(f)
     except (OSError, ValueError):
         return {}
 
@@ -301,69 +316,115 @@ def save_sync(state):
     os.replace(tmp, SYNC_FILE)
 
 
-def full_walk(db, cx, org, corpus, provider, account, roots, count_missed=False):
-    """Every confirmed folder, listed in full. Removals happen only from a COMPLETE walk (D32): a partial
-    listing once sent 39 live files back for re-upload. Returns (sync state, files, folders, missed)."""
-    files, folders, complete = {}, set(), True
-    token = None
-    try:  # the bookmark is taken BEFORE the walk, so a change during it is caught by the next pass
-        token = drive_start_token(cx, account)
-    except Exception as e:
-        log(f"plan: no changes bookmark ({e}); next pass walks in full again")
-    for root in roots:
-        try:
-            got, walked, ok = drive_walk(cx, account, root)
-        except Exception as e:  # a failed walk removes nothing
-            log(f"plan: walking {provider}:{root} failed: {e}")
-            got, walked, ok = {}, set(), False
-        files.update(got)
-        folders |= walked
+def walk_group(db, cx, org, corpus, provider, conns, state, keys):
+    """Every live connection in one store, each over its own ticked folders, listed in full. Removals happen only
+    when EVERY walk is complete (D32: a partial listing once sent 39 live files back for re-upload), and only for
+    documents no connection saw whose owner is one of these live connections (or nobody): a document read through
+    a connection that has stopped working stays until that connection is back. Owners: a live owner that still
+    sees the file keeps it, otherwise the first connection that saw it takes it. Returns (files, folders, missed)."""
+    seen = {}  # external_id -> (file, [connections that saw it])
+    complete, folder_count = True, 0
+    count_missed = all((state.get(keys[cid]) or {}).get("token") for cid in conns)
+    fresh = {}
+    for cid in sorted(conns):
+        entry = conns[cid]
+        if not entry["roots"]:  # nothing ticked any more: nothing to list, and nothing of theirs is kept
+            fresh[cid] = {"token": None, "folders": [], "roots": [], "walked_at": time.time()}
+            continue
+        token = None
+        try:  # the bookmark is taken BEFORE the walk, so a change during it is caught by the next pass
+            token = drive_start_token(cx, entry["acct"])
+        except Exception as e:
+            log(f"plan: no changes bookmark for connection {cid} ({e}); next pass walks in full again")
+        files, folders, ok = {}, set(), True
+        for root in entry["roots"]:
+            try:
+                got, walked, root_ok = drive_walk(cx, entry["acct"], root)
+            except Exception as e:  # a failed walk removes nothing
+                log(f"plan: walking {provider}:{root} for connection {cid} failed: {e}")
+                got, walked, root_ok = {}, set(), False
+            files.update(got)
+            folders |= walked
+            ok = ok and root_ok
         complete = complete and ok
-    # What the changes feed should already have brought us: anything here that we do not hold at this
-    # revision was missed (only meaningful when a feed was running, not on a first walk).
-    missed = 0
-    if count_missed and files:
-        held = dict(db.execute(
-            "select external_id, source_revision from documents where org_id = %s and corpus_id = %s and provider = %s "
-            "and state <> 'removed' and external_id = any(%s::text[])", (org, corpus, provider, list(files))).fetchall())
+        folder_count += len(folders)
         for external_id, f in files.items():
-            revision = str(f.get("version") or f.get("modifiedTime") or "")
-            if held.get(external_id) != revision:
+            seen.setdefault(external_id, (f, []))[1].append(cid)
+        fresh[cid] = {"token": token, "folders": sorted(folders), "roots": sorted(entry["roots"]), "walked_at": time.time()} if ok and token else None
+    held = {}
+    if seen:
+        held = {r[0]: (r[1], r[2]) for r in db.execute(
+            "select external_id, source_revision, connection_id::text from documents where org_id = %s and corpus_id = %s "
+            "and provider = %s and state <> 'removed' and external_id = any(%s::text[])", (org, corpus, provider, list(seen))).fetchall()}
+    # What the changes feeds should already have brought us: anything here that we do not hold at this revision
+    # was missed (only meaningful when every feed was running, not on a first walk).
+    missed = 0
+    if count_missed:
+        for external_id, (f, _) in seen.items():
+            if (held.get(external_id) or (None, None))[0] != str(f.get("version") or f.get("modifiedTime") or ""):
                 missed += 1
-    for f in files.values():
-        upsert_file(db, org, corpus, provider, f)
+    for external_id, (f, saw) in seen.items():
+        current = (held.get(external_id) or (None, None))[1]
+        upsert_file(db, org, corpus, provider, f, current if current in saw else saw[0])
     if complete:
         gone = db.execute(
-            "select external_id from documents where org_id = %s and corpus_id = %s and provider = %s "
-            "and state <> 'removed' and not (external_id = any(%s::text[]))", (org, corpus, provider, list(files))).fetchall()
+            "select external_id from documents where org_id = %s and corpus_id = %s and provider = %s and state <> 'removed' "
+            "and not (external_id = any(%s::text[])) and (connection_id is null or connection_id = any(%s::uuid[]))",
+            (org, corpus, provider, list(seen), list(conns))).fetchall()
         for (external_id,) in gone:
             drop_file(db, org, corpus, provider, external_id)
         if gone:
             log(f"plan: removed {len(gone)} file(s) no longer in the selection")
     else:
         log(f"plan: {provider} walk incomplete; nothing removed this pass")
-    log(f"plan: walked {len(folders)} folder(s), {len(files)} file(s)" + (f", {missed} missed by the changes feed" if count_missed else ""))
-    state = {"token": token, "folders": sorted(folders), "roots": sorted(roots), "walked_at": time.time()} if complete and token else None
-    return state, len(files), len(folders), missed
+    for cid in conns:
+        if fresh[cid]:
+            state[keys[cid]] = fresh[cid]
+        else:
+            state.pop(keys[cid], None)
+    who = f" across {len(conns)} connections" if len(conns) > 1 else ""
+    log(f"plan: walked {folder_count} folder(s), {len(seen)} file(s){who}" + (f", {missed} missed by the changes feed" if count_missed else ""))
+    return len(seen), folder_count, missed
 
 
-def incremental(db, cx, org, corpus, provider, account, saved):
-    """What changed since the last pass, in one or two calls. False if the feed could not be read, which
-    sends this pass back to a full walk."""
+def owned_by(db, org, corpus, provider, external_id, cid):
+    row = db.execute("select 1 from documents where org_id = %s and corpus_id = %s and provider = %s and external_id = %s "
+                     "and state <> 'removed' and connection_id = %s", (org, corpus, provider, external_id, cid)).fetchone()
+    return row is not None
+
+
+def incremental(db, cx, org, corpus, provider, cid, acct, saved, live):
+    """What changed for one connection since the last pass, in one or two calls. False if the feed could not be
+    read, which sends the store back to a full walk. Drive reports `removed` when a file leaves THIS person's view,
+    and a move out of their folders only for them: with other connections in the store someone else may still
+    reach it, so instead of removing it here, a document this connection owns asks for a walk of the whole store
+    next pass. A trashed file is gone for everyone and goes at once."""
     try:
-        changes, token = drive_changes(cx, account, saved["token"])
+        changes, token = drive_changes(cx, acct, saved["token"])
     except Exception as e:
-        log(f"plan: changes feed failed ({e})")
+        log(f"plan: changes feed failed for connection {cid} ({e})")
         return False
+    shared = len(live) > 1
     folders = set(saved["folders"])
     fresh, touched = [], 0
+
+    def left(external_id):
+        if not shared:
+            return drop_file(db, org, corpus, provider, external_id)
+        if owned_by(db, org, corpus, provider, external_id, cid):
+            saved["walk"] = True
+        return 0
+
     for ch in changes:
         f = ch.get("file") or {}
         external_id = ch.get("fileId") or f.get("id")
         if not external_id:
             continue
-        if ch.get("removed") or f.get("trashed"):
+        if f.get("trashed"):
             touched += drop_file(db, org, corpus, provider, external_id)
+            continue
+        if ch.get("removed"):
+            touched += left(external_id)
             continue
         parents = f.get("parents") or []
         inside = any(p in folders for p in parents)
@@ -374,59 +435,95 @@ def incremental(db, cx, org, corpus, provider, account, saved):
         if f.get("mimeType") == SHORTCUT or f.get("shortcutDetails"):
             continue
         if inside:
-            upsert_file(db, org, corpus, provider, f)
+            upsert_file(db, org, corpus, provider, f, cid, live)
             touched += 1
-        elif parents:  # moved out of every ticked folder
-            touched += drop_file(db, org, corpus, provider, external_id)
+        elif parents:  # moved out of every folder this person ticked
+            touched += left(external_id)
     for folder in fresh:
         try:
-            got, walked, _ = drive_walk(cx, account, folder)
+            got, walked, _ = drive_walk(cx, acct, folder)
         except Exception as e:
             log(f"plan: walking new folder {folder} failed: {e}")
             continue
         folders |= walked
         for f in got.values():
-            upsert_file(db, org, corpus, provider, f)
+            upsert_file(db, org, corpus, provider, f, cid, live)
         touched += len(got)
     saved["token"] = token
     saved["folders"] = sorted(folders)
     if changes:
-        log(f"plan: {len(changes)} change(s), {len(fresh)} new folder(s), {touched} file(s) touched")
+        log(f"plan: connection {cid}: {len(changes)} change(s), {len(fresh)} new folder(s), {touched} file(s) touched"
+            + ("; a whole-store walk is due" if saved.get("walk") else ""))
     return True
 
 
+def claim_unowned(db, org):
+    """Documents written before this worker knew about owners (or by an older worker after the migration that added
+    them) belong to the store's one live connection, when it has exactly one. With several, the next walk decides."""
+    db.execute(
+        """update documents d set connection_id = c.id from corpus_connections c
+           where d.org_id = %s and d.connection_id is null and d.state <> 'removed'
+             and c.corpus_id = d.corpus_id and c.provider = d.provider and c.status = 'ACTIVE'
+             and (select count(*) from corpus_connections c2 where c2.corpus_id = d.corpus_id and c2.provider = d.provider
+                  and c2.status = 'ACTIVE') = 1""", (org,))
+
+
 def plan(db, cx, org):
+    claim_unowned(db, org)
+    # A ticked folder is read through the connection that added it. One ticked before connections were recorded
+    # on folders has none, and belongs to its adder's connection (the only person who could browse that store).
     sources = db.execute(
-        "select s.corpus_id, s.provider, s.external_id, c.composio_connected_account_id "
-        "from corpus_sources s join corpus_connections c on c.corpus_id = s.corpus_id and c.provider = s.provider "
-        "where s.org_id = %s and s.confirmed_at is not null and c.status = 'ACTIVE'", (org,)).fetchall()
-    selections = {}  # (corpus, provider) -> {account, roots}
-    for corpus, provider, root, account in sources:
+        """select c.id::text, c.composio_user_id, c.composio_connected_account_id, s.corpus_id::text, s.provider, s.external_id
+           from corpus_sources s join corpus_connections c
+             on c.corpus_id = s.corpus_id and c.provider = s.provider
+            and (c.id = s.connection_id or (s.connection_id is null and c.grant_holder_user_id = s.added_by))
+           where s.org_id = %s and s.confirmed_at is not null and c.status = 'ACTIVE'""", (org,)).fetchall()
+    stores = {}  # (corpus, provider) -> {connection: {acct, roots}}
+    # Every live connection belongs to its store even with nothing ticked: when someone removes their last folder,
+    # the walk that follows is what takes its files out.
+    for cid, user, account, corpus, provider in db.execute(
+            "select id::text, composio_user_id, composio_connected_account_id, corpus_id::text, provider from corpus_connections "
+            "where org_id = %s and status = 'ACTIVE' and provider = 'googledrive'", (org,)).fetchall():
+        stores.setdefault((corpus, provider), {})[cid] = {"acct": (user, account), "roots": []}
+    for cid, user, account, corpus, provider, root in sources:
         if provider != "googledrive":
             log(f"plan: no ingestion adapter for {provider} yet; skipping {root}")
             continue
-        entry = selections.setdefault((corpus, provider), {"account": account, "roots": []})
-        entry["roots"].append(root)
+        stores.setdefault((corpus, provider), {}).setdefault(cid, {"acct": (user, account), "roots": []})["roots"].append(root)
 
     state = load_sync()
-    ran = []
-    for (corpus, provider), entry in selections.items():
-        key = f"{corpus}:{provider}"
-        saved = state.get(key) or {}
-        # A full walk when there is nothing to go on, when the ticked folders change, or once a day.
-        usable = saved.get("token") and saved.get("folders") and saved.get("roots") == sorted(entry["roots"])
-        due = time.time() - (saved.get("walked_at") or 0) > FULL_WALK_SECONDS
-        if usable and not due and incremental(db, cx, org, corpus, provider, entry["account"], saved):
-            state[key] = saved
-            ran.append(("changes", 0, 0, 0))
-        else:
-            fresh, files, folders, missed = full_walk(db, cx, org, corpus, provider, entry["account"], entry["roots"], count_missed=usable)
+    kept, ran = set(), []
+    for (corpus, provider), conns in stores.items():
+        keys = {cid: f"{corpus}:{provider}:{cid}" for cid in conns}
+        kept |= set(keys.values())
+        old = f"{corpus}:{provider}"  # the one-connection key; carried over so the upgrade forces no full walk
+        if old in state and len(conns) == 1 and next(iter(keys.values())) not in state:
+            state[next(iter(keys.values()))] = state.pop(old)
+
+        def needs_walk(cid):
+            saved = state.get(keys[cid]) or {}
+            if not conns[cid]["roots"]:
+                # Nothing ticked: a walk only when they still own documents (their last folder just went), so a
+                # person who has connected but not chosen anything yet costs no walk of the whole store.
+                return saved.get("roots") != [] and db.execute(
+                    "select 1 from documents where connection_id = %s and state <> 'removed' limit 1", (cid,)).fetchone() is not None
+            usable = saved.get("token") and saved.get("folders") and saved.get("roots") == sorted(conns[cid]["roots"]) and not saved.get("walk")
+            return not usable or time.time() - (saved.get("walked_at") or 0) > FULL_WALK_SECONDS
+
+        # A full walk when any connection has nothing to go on, changed its ticked folders or is due, and then of
+        # every connection in the store: with several, only the whole store's walk can say a file is gone.
+        walk = any(needs_walk(cid) for cid in conns)
+        if not walk:
+            for cid in sorted(c for c in conns if conns[c]["roots"]):
+                if not incremental(db, cx, org, corpus, provider, cid, conns[cid]["acct"], state[keys[cid]], list(conns)):
+                    walk = True
+                    break
+            if not walk:
+                ran.append(("changes", 0, 0, 0))
+        if walk:
+            files, folders, missed = walk_group(db, cx, org, corpus, provider, conns, state, keys)
             ran.append(("walk", folders, files, missed))
-            if fresh:
-                state[key] = fresh
-            else:
-                state.pop(key, None)
-    save_sync({k: v for k, v in state.items() if k in {f"{c}:{p}" for c, p in selections}})
+    save_sync({k: v for k, v in state.items() if k in kept})
     # The worker's heartbeat: a pass that changes nothing still proves the worker is alive, which document
     # timestamps no longer can now that most passes write nothing.
     if ran:
@@ -439,17 +536,17 @@ def plan(db, cx, org):
 def send(db, cx, org):
     rows = db.execute(
         """select d.id, d.provider, d.external_id, d.name, d.mime_type, d.web_url, d.source_revision, d.ragflow_doc_id,
-                  d.attempts, c.composio_connected_account_id
-           from documents d join corpus_connections c on c.corpus_id = d.corpus_id and c.provider = d.provider
+                  d.attempts, c.composio_user_id, c.composio_connected_account_id
+           from documents d join corpus_connections c on c.id = d.connection_id
            where d.org_id = %s and d.state = 'pending' and c.status = 'ACTIVE'
            -- Documents an operator marked as wanted first (`npm run org -- priority`), then oldest waiting.
            order by d.priority desc, d.updated_at limit %s""", (org, BATCH)).fetchall()
     started = []
-    for doc_id, provider, ext_id, name, mime, web_url, revision, old_rf, attempts, account in rows:
+    for doc_id, provider, ext_id, name, mime, web_url, revision, old_rf, attempts, user, account in rows:
         db.execute("update documents set state = 'uploading', updated_at = now() where id = %s", (doc_id,))
         db.commit()
         try:
-            filename, content = drive_download(cx, account, {"external_id": ext_id, "name": name, "mimeType": mime})
+            filename, content = drive_download(cx, (user, account), {"external_id": ext_id, "name": name, "mimeType": mime})
             if old_rf:
                 rag.delete([old_rf])
             rf = rag.upload(filename, content)
@@ -531,7 +628,8 @@ def retry(db, doc_id, why):
 
 def load_progress():
     try:
-        return json.load(open(PROGRESS_FILE))
+        with open(PROGRESS_FILE) as f:
+            return json.load(f)
     except (OSError, ValueError):
         return {}
 
@@ -555,7 +653,7 @@ def main():
     tenant = json.load(open("/etc/bebuilt/ragflow-tenant.json"))
     global rag
     rag = RAGFlow(tenant["api_key"], tenant["dataset_id"])
-    cx = Composio(cfg["COMPOSIO_API_KEY"], cfg["COMPOSIO_USER_ID"])
+    cx = Composio(cfg["COMPOSIO_API_KEY"], cfg.get("COMPOSIO_USER_ID"))
     org = cfg["ORG_ID"]
     t = time.time()
     with psycopg.connect(cfg["WORKER_DB_URL"], connect_timeout=20) as db:
