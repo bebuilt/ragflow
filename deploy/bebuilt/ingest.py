@@ -41,6 +41,11 @@ RAGFLOW = "http://127.0.0.1:8080/api/v1"
 COMPOSIO = "https://backend.composio.dev/api/v3.1"
 DRIVE_TOOLS_VERSION = "20260915_00"  # keep in step with bebuilt-app src/lib/storage/googledrive.ts
 BATCH = 25  # files sent per pass
+# RAGFlow parses far slower than we can upload, so an unthrottled worker buries it: Molzer's queue reached
+# 2,337 entries (2026-09-21), which made the priority order meaningless — everything marked first still sat
+# behind hours of work — and left the executor grinding through phantom entries after a cancel. A pass sends
+# nothing while RAGFlow still has this many documents in hand.
+QUEUE_HIGH = 40
 MAX_BYTES = 100 * 1024 * 1024
 MAX_ATTEMPTS = 3
 # RAGFlow runs its vision pipeline (layout detection and OCR, ~6 s a page) over every PDF page, even pages
@@ -150,6 +155,11 @@ class RAGFlow:
 
     def stop(self, doc_ids):
         self._ok(self.s.delete(f"{RAGFLOW}/datasets/{self.ds}/chunks", json={"document_ids": doc_ids}, timeout=60))
+
+    def queued(self):
+        """Documents RAGFlow is still working on. One cheap call: the listing reports the total."""
+        data = self._ok(self.s.get(f"{RAGFLOW}/datasets/{self.ds}/documents", params={"page": 1, "page_size": 1, "run": "RUNNING"}, timeout=60))
+        return int(data.get("total") or 0) if isinstance(data, dict) else 0
 
     def all_docs(self):
         """{doc_id: doc} for everything in the dataset, or raise if the listing comes back short. A doc is
@@ -544,6 +554,14 @@ def plan(db, cx, org):
 
 
 def send(db, cx, org):
+    try:
+        waiting = rag.queued()
+    except Exception as e:
+        log(f"send: cannot read RAGFlow's queue ({e}); sending nothing this pass")
+        return
+    if waiting >= QUEUE_HIGH:
+        log(f"send: RAGFlow still holds {waiting} document(s); waiting rather than burying it")
+        return
     rows = db.execute(
         """select d.id, d.provider, d.external_id, d.name, d.mime_type, d.web_url, d.source_revision, d.ragflow_doc_id,
                   d.attempts, c.composio_user_id, c.composio_connected_account_id
