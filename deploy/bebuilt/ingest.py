@@ -645,6 +645,13 @@ def reconcile(db, org):
             # Parsing can fail for passing reasons (a timed-out embedding call, a restart); retry before giving up.
             retry(db, doc_id, (d.get("progress_msg") or "parsing failed")[-500:])
         elif run in ("RUNNING", "1"):
+            # Waiting is not stalling. A document behind others in RAGFlow's queue shows no progress for as
+            # long as the queue takes, and RAGFlow says so ("N tasks are ahead in the queue"). Counting that
+            # as stranded re-sent 309 live documents on LaborTech's box until they ran out of attempts
+            # (2026-09-22). Only a document RAGFlow claims to be working on can stall.
+            if "ahead in the queue" in (d.get("progress_msg") or ""):
+                marks.pop(rf, None)
+                continue
             # RAGFlow keeps touching a stranded doc's update_time, so only its progress shows whether work is happening.
             mark = f"{d.get('progress')}|{len(d.get('progress_msg') or '')}"
             seen = marks.get(rf)
