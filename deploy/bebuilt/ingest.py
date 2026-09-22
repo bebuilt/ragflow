@@ -108,7 +108,22 @@ def load_env(path):
     return out
 
 
+class Blocked(Exception):
+    """Google has flagged this file and hands it over only if the caller acknowledges the warning."""
+
+
 class Composio:
+    def token(self, acct):
+        """This connection's own Google token. Used for one thing: fetching a file the client has explicitly
+        allowed, which Composio's download tool cannot do because it takes no acknowledgeAbuse argument."""
+        _, account_id = acct
+        r = self.s.get(f"{COMPOSIO}/connected_accounts/{account_id}", timeout=60)
+        r.raise_for_status()
+        tok = ((r.json().get("state") or {}).get("val") or {}).get("access_token")
+        if not tok:
+            raise RuntimeError("Composio returned no access token for this connection")
+        return tok
+
     def __init__(self, key, default_user=None):
         self.s = requests.Session()
         self.s.headers["x-api-key"] = key
@@ -240,9 +255,18 @@ def drive_changes(cx, acct, token):
         token = nxt
 
 
-def drive_download(cx, acct, f):
-    """(filename, bytes) for a file RAGFlow can parse, or raise Skip."""
+def drive_download(cx, acct, f, acknowledged=False):
+    """(filename, bytes) for a file RAGFlow can parse, or raise Skip/Blocked."""
     mime = f["mimeType"]
+    if acknowledged and mime not in EXPORT:
+        # A file an admin of this org allowed: straight to Drive, warning acknowledged, this file only.
+        ext = INDEXED[mime]
+        r = requests.get(f"https://www.googleapis.com/drive/v3/files/{f['external_id']}",
+                         params={"alt": "media", "acknowledgeAbuse": "true", "supportsAllDrives": "true"},
+                         headers={"Authorization": f"Bearer {cx.token(acct)}"}, timeout=300)
+        r.raise_for_status()
+        name = f["name"] if f["name"].lower().endswith(ext) else f"{f['name']}{ext}"
+        return name, r.content
     if mime in EXPORT:
         export_mime, ext = EXPORT[mime]
         data = cx.run(acct, "GOOGLEDRIVE_DOWNLOAD_FILE", {"fileId": f["external_id"], "mime_type": export_mime})
@@ -254,6 +278,10 @@ def drive_download(cx, acct, f):
     content = data.get("downloaded_file_content") or {}
     url = content.get("s3url")
     if not url:
+        refusal = json.dumps(data)[:500]
+        # Google names the flag in its refusal; the file needs someone in the client's org to confirm.
+        if "acknowledgeAbuse" in refusal or "cannot be downloaded" in refusal.lower():
+            raise Blocked("Google has flagged this file and will only release it if someone confirms")
         raise RuntimeError("Composio returned no file")
     r = requests.get(url, timeout=300)
     r.raise_for_status()
@@ -564,17 +592,17 @@ def send(db, cx, org):
         return
     rows = db.execute(
         """select d.id, d.provider, d.external_id, d.name, d.mime_type, d.web_url, d.source_revision, d.ragflow_doc_id,
-                  d.attempts, c.composio_user_id, c.composio_connected_account_id
+                  d.attempts, d.acknowledged, c.composio_user_id, c.composio_connected_account_id
            from documents d join corpus_connections c on c.id = d.connection_id
            where d.org_id = %s and d.state = 'pending' and c.status = 'ACTIVE'
            -- Documents an operator marked as wanted first (`npm run org -- priority`), then oldest waiting.
            order by d.priority desc, d.updated_at limit %s""", (org, BATCH)).fetchall()
     started = []
-    for doc_id, provider, ext_id, name, mime, web_url, revision, old_rf, attempts, user, account in rows:
+    for doc_id, provider, ext_id, name, mime, web_url, revision, old_rf, attempts, acknowledged, user, account in rows:
         db.execute("update documents set state = 'uploading', updated_at = now() where id = %s", (doc_id,))
         db.commit()
         try:
-            filename, content = drive_download(cx, (user, account), {"external_id": ext_id, "name": name, "mimeType": mime})
+            filename, content = drive_download(cx, (user, account), {"external_id": ext_id, "name": name, "mimeType": mime}, acknowledged)
             if old_rf:
                 rag.delete([old_rf])
             rf = rag.upload(filename, content)
@@ -588,6 +616,10 @@ def send(db, cx, org):
             started.append(rf)
         except Skip as e:
             db.execute("update documents set state = 'skipped', last_error = %s, updated_at = now() where id = %s", (str(e), doc_id))
+        except Blocked as e:
+            # Not a failure and not ours to decide: it waits for an admin of this org to allow or skip it.
+            db.execute("update documents set state = 'blocked', last_error = %s, updated_at = now() where id = %s", (str(e), doc_id))
+            log(f"send: {name} needs a decision: {e}")
         except Exception as e:
             state = "failed" if attempts + 1 >= MAX_ATTEMPTS else "pending"
             db.execute("update documents set state = %s, attempts = attempts + 1, last_error = %s, updated_at = now() where id = %s",
