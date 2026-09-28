@@ -55,3 +55,6 @@ Rules this directory keeps:
 - **Failed for good is not stuck.** After three attempts a document is `failed` and the app stops counting it
   as work in progress; it is retried only when the file changes in the store. Re-queue it by hand
   (`pending`, `attempts = 0`) once the cause is fixed.
+- **An image with no text is skipped, not failed** (Dropbox stores). An image RAGFlow parses to nothing, or fails for want of a
+  vision model (`No default vision model is set.`), ends `skipped` with `last_error = 'no_text'` at once, no attempts
+  spent, and is sent again only when its Dropbox rev changes; the cutover diff lists it as `skipped:no_text`.

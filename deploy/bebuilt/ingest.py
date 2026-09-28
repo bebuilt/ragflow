@@ -112,6 +112,10 @@ IMAGES = {
     ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".tif": "image/tiff", ".tiff": "image/tiff",
     ".bmp": "image/bmp", ".gif": "image/gif", ".webp": "image/webp",
 }
+# RAGFlow's picture parser OCRs an image and, when that finds little, asks the tenant's vision model to describe it;
+# with no vision model the parse fails with this (api/db/joint_services/tenant_model_service.py). An image that fails
+# so, or parses to nothing, has no text to index: it is skipped as `no_text` at once, not retried, until its rev moves.
+NO_VISION = ("No default vision model is set", "No default image2text model is set")
 DROPBOX_TYPES = {**{ext: mime for mime, ext in INDEXED.items()}, ".htm": "text/html", **IMAGES}
 # A Dropbox cloud doc (Google Docs/Sheets/Slides or Paper kept in Dropbox) has no bytes of its own; a plain download
 # answers with an HTML stub (Onyx's override, 2025). It is recorded under this type and exported instead.
@@ -935,6 +939,12 @@ def reconcile(db, org):
                 escalated += 1
             except Exception as e:
                 log(f"reconcile: sending {name} to OCR failed: {e}")
+            continue
+        if mime in IMAGES.values() and (run in ("DONE", "3") and not d.get("chunk_count") or run in ("FAIL", "4")
+                                        and any(m in (d.get("progress_msg") or "") for m in NO_VISION)):
+            # Recorded against what was sent, like an indexed file, so only a new revision sends it again.
+            db.execute("update documents set state = 'skipped', last_error = 'no_text', indexed_revision = %s, chunk_count = 0, "
+                       "updated_at = now() where id = %s", (sent, doc_id))
             continue
         if run in ("DONE", "3"):
             # Recorded against what was sent; if the file moved on meanwhile, it goes straight back to pending.

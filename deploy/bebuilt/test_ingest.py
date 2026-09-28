@@ -592,6 +592,38 @@ class IngestTest(unittest.TestCase):
         self.assertIn("page.tif", self.rag.uploads, "RAGFlow knows .tif, not .tiff")
         self.assertEqual(self.rag.configs[self.row("/t/a.pdf", "ragflow_doc_id")[0]], ingest.PLAIN)
 
+    def no_text(self, parsed):
+        """An image and a PDF through one pass, RAGFlow's verdict on both, then reconcile and two more passes."""
+        self.connect(A, UA, "org-ask", "ca_x", provider="dropbox")
+        self.dbx.teams["ca_x"] = {e["path_display"]: e for e in [entry("/T/photo.jpg"), entry("/T/scan.pdf")]}
+        self.tick("/t", A, UA, provider="dropbox")
+        self.run_pass()
+        for path in ("/t/photo.jpg", "/t/scan.pdf"):
+            rf = self.row(path, "ragflow_doc_id")[0]
+            self.rag.docs[rf] = {"id": rf, **parsed, "meta_fields": self.rag.tags[rf]}
+        ingest.reconcile(self.db, ORG)
+        self.assertEqual(self.row("/t/photo.jpg", "state", "last_error", "attempts"), ("skipped", "no_text", 0))
+        uploads = self.rag.uploads.count("photo.jpg")
+        self.force_walk()
+        self.run_pass()
+        ingest.reconcile(self.db, ORG)
+        self.assertEqual(self.row("/t/photo.jpg", "state", "last_error"), ("skipped", "no_text"), "same rev: left alone")
+        self.assertEqual(self.rag.uploads.count("photo.jpg"), uploads, "never sent again")
+        self.dbx.teams["ca_x"]["/T/photo.jpg"] = entry("/T/photo.jpg", rev="2")
+        self.force_walk()
+        self.run_pass()
+        self.assertEqual(self.row("/t/photo.jpg", "state", "sent_revision"), ("parsing", "2"), "a new rev is tried again")
+
+    def test_an_image_ragflow_wants_a_vision_model_for_is_skipped_as_no_text(self):
+        self.no_text({"run": "FAIL", "progress_msg": "[ERROR]No default vision model is set."})
+        self.assertEqual(self.row("/t/scan.pdf", "state", "attempts"), ("parsing", 1), "a failed PDF spends an attempt and is sent again, as before")
+
+    def test_an_image_that_parses_to_nothing_is_skipped_as_no_text(self):
+        self.no_text({"run": "DONE", "chunk_count": 0})
+        rf = self.row("/t/scan.pdf", "ragflow_doc_id")[0]
+        self.assertEqual((self.row("/t/scan.pdf", "state")[0], self.rag.configs[rf]), ("parsing", ingest.OCR),
+                         "an empty PDF still goes on to OCR")
+
     def test_dropbox_asks_for_a_new_link_when_the_old_one_has_expired(self):
         self.connect(A, UA, "org-ask", "ca_x", provider="dropbox")
         self.dbx.teams["ca_x"] = {"/T/a.pdf": entry("/T/a.pdf")}
