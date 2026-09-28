@@ -10,7 +10,7 @@ the only thing bebuilt adds to the fork; everything else tracks upstream.
 | `env.bebuilt` | Non-secret settings layered onto `docker/.env`: the image pinned by digest, OpenSearch, local embeddings, no self-registration. |
 | `tenant-setup.py` | Runs inside the RAGFlow container: this box's app user, its API key and the `shared` dataset (embedding model pinned; never changed once the dataset exists). Writes `/etc/bebuilt/ragflow-tenant.json`. |
 | `ingest.py` + `bebuilt-ingest.{service,timer}` | The ingestion worker, every five minutes: walks the confirmed selection through Composio, sends new and changed files to RAGFlow, records progress in the platform DB as `worker_<slug>` (RLS: this org's rows only). |
-| `test_ingest.py` | The worker's selection, ownership and removal logic against a throwaway Postgres and a fake Drive per person (see its header for the two commands). |
+| `test_ingest.py` | The worker's selection, ownership and removal logic against a throwaway Postgres, a fake Drive per person and a fake Dropbox team behind the Composio proxy (see its header for the two commands). |
 | `ragflow-dump.sh` | Nightly consistent MySQL dump onto the box's own disk (keeps three), so each Hetzner backup holds a clean copy. |
 
 It is driven from the laptop by `scripts/ragflow-provision.sh <client> <host> [ref]` in

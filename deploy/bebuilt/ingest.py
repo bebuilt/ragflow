@@ -7,6 +7,9 @@ Config, all this client's own (the box leaves our hands; nothing here reaches an
                                     ORG_ID, COMPOSIO_API_KEY, COMPOSIO_USER_ID (only for a connection that
                                     records no identity of its own)
 
+Stores are Google Drive or Dropbox (2026-09-28). A Dropbox store is keyed by path (`external_id = path_lower`) and
+read through Composio's proxy to the raw API, because Composio's Dropbox tools cannot continue a listing or download.
+
 Each person adds folders from their own Drive into the one shared index (2026-09-22), so a store can have several
 connections, each under its own Composio identity. Everything here is keyed by connection: its roots, its changes
 token, what it downloads. A file two people can reach is ONE document, owned by one connection (`documents.
@@ -29,9 +32,11 @@ A pass:
 """
 import fcntl
 import json
+import mimetypes
 import os
 import sys
 import time
+import urllib.parse
 from datetime import datetime, timezone
 
 import psycopg
@@ -39,6 +44,13 @@ import requests
 
 RAGFLOW = "http://127.0.0.1:8080/api/v1"
 COMPOSIO = "https://backend.composio.dev/api/v3.1"
+COMPOSIO_PROXY = "https://backend.composio.dev/api/v3/tools/execute/proxy"  # verified against CDC's team, 2026-09-28
+DROPBOX_API = "https://api.dropboxapi.com/2"
+DROPBOX_CONTENT = "https://content.dropboxapi.com/2"
+# Connection drops, 429s and 5xx from the proxy (or from Dropbox behind it) are retried: Onyx's Dropbox connector
+# lost whole walks to a single dropped connection until it retried. Seconds, doubled each try.
+PROXY_TRIES = 5
+BACKOFF = 2
 DRIVE_TOOLS_VERSION = "20260915_00"  # keep in step with bebuilt-app src/lib/storage/googledrive.ts
 BATCH = 100  # files sent per pass
 # Keep RAGFlow fed but never buried. Sending everything at once made Molzer's queue 2,337 deep, which made
@@ -64,6 +76,7 @@ PROGRESS_FILE = "/var/lib/bebuilt/ingest-progress.json"  # {ragflow_doc_id: {"ma
 # which is one or two calls however large the selection. The full walk still runs daily as the backstop for
 # anything the changes feed does not carry.
 SYNC_FILE = "/var/lib/bebuilt/drive-sync.json"  # {"<corpus>:<provider>:<connection>": {token, folders, roots, walked_at, walk?}}
+# A Dropbox connection keeps {cursors: {root: cursor}, walked: {root: time}, roots, walk?} under the same key.
 # Weekly (Brandon, 2026-09-21). The walk is no longer how changes are noticed, only the backstop for what the
 # feed might not carry — so every walk counts what the feed never reported (`missed`) into `ingest_runs`, and
 # the health check alerts on it. Zero for a few weeks is the evidence for dropping it further.
@@ -92,6 +105,17 @@ INDEXED = {
     "application/rtf": ".rtf",
     "application/json": ".json",
 }
+# Dropbox names carry the type only as an extension. Images are Dropbox-only for now (D12, 2026-09-28): 439 of
+# CDC's Onyx documents were scans with text, mostly lease and SOMA pages. Drive stores keep skipping images, so
+# no Drive client pays OCR for every photo in their folders without asking for it.
+IMAGES = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".tif": "image/tiff", ".tiff": "image/tiff",
+    ".bmp": "image/bmp", ".gif": "image/gif", ".webp": "image/webp",
+}
+DROPBOX_TYPES = {**{ext: mime for mime, ext in INDEXED.items()}, ".htm": "text/html", **IMAGES}
+# A Dropbox cloud doc (Google Docs/Sheets/Slides or Paper kept in Dropbox) has no bytes of its own; a plain download
+# answers with an HTML stub (Onyx's override, 2025). It is recorded under this type and exported instead.
+DROPBOX_CLOUD = "application/vnd.dropbox.cloud-doc"
 
 
 def log(msg):
@@ -140,6 +164,35 @@ class Composio:
         if not body.get("successful"):
             raise RuntimeError(f"{slug}: {body.get('error') or 'failed'}")
         return body.get("data") or {}
+
+    def proxy(self, acct, endpoint, body=None, headers=None):
+        """One raw API call through the connection, as {data, status, headers, binary_data?}. `status` is the
+        provider's own: a Dropbox 409 comes back inside an HTTP 200. Drops, 429s and 5xx are retried with backoff."""
+        _, account_id = acct
+        req = {"endpoint": endpoint, "method": "POST", "connected_account_id": account_id,
+               "parameters": [{"name": k, "value": v, "type": "header"} for k, v in (headers or {}).items()]}
+        if body is not None:
+            req["body"] = body
+        for attempt in range(PROXY_TRIES):
+            wait = BACKOFF * 2 ** attempt
+            try:
+                r = self.s.post(COMPOSIO_PROXY, timeout=300, json=req)
+                if r.status_code != 429 and r.status_code < 500:
+                    r.raise_for_status()
+                    out = r.json()
+                    status = out.get("status")
+                    if status != 429 and not (isinstance(status, int) and status >= 500):
+                        return out
+                    retry_after = {k.lower(): v for k, v in (out.get("headers") or {}).items()}.get("retry-after")
+                    wait = max(wait, int(retry_after)) if str(retry_after or "").isdigit() else wait
+                    why = f"{endpoint} answered {status}"
+                else:
+                    why = f"proxy answered {r.status_code}"
+            except (requests.ConnectionError, requests.Timeout) as e:
+                why = f"{endpoint}: {e}"
+            if attempt + 1 == PROXY_TRIES:
+                raise RuntimeError(f"{why}, {PROXY_TRIES} tries")
+            time.sleep(wait)
 
 
 class RAGFlow:
@@ -293,8 +346,109 @@ class Skip(Exception):
     pass
 
 
-def indexable(mime, size):
-    if mime not in EXPORT and mime not in INDEXED:
+# --- Dropbox ------------------------------------------------------------------------------------------
+
+class DropboxError(Exception):
+    def __init__(self, endpoint, status, data):
+        self.status = status
+        self.summary = (data.get("error_summary") if isinstance(data, dict) else str(data or "")) or ""
+        super().__init__(f"{endpoint.rsplit('/2/', 1)[-1]}: Dropbox answered {status} {self.summary[:300]}".rstrip())
+
+
+def dropbox_namespace(cx, acct):
+    """The team's root namespace. Every later call names it in Dropbox-API-Path-Root: without it the proxy lands in
+    the person's home folder, where a team folder is `path/not_found` (CDC, 2026-09-28)."""
+    endpoint = f"{DROPBOX_API}/users/get_current_account"
+    out = cx.proxy(acct, endpoint)
+    if out.get("status") != 200:
+        raise DropboxError(endpoint, out.get("status"), out.get("data"))
+    return str(out["data"]["root_info"]["root_namespace_id"])
+
+
+def dropbox_call(cx, acct, ns, endpoint, body=None, arg=None):
+    headers = {"Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": ns})}
+    if arg is not None:
+        headers["Dropbox-API-Arg"] = json.dumps(arg)
+    out = cx.proxy(acct, endpoint, body, headers)
+    if out.get("status") != 200:
+        raise DropboxError(endpoint, out.get("status"), out.get("data"))
+    return out
+
+
+def dropbox_list(cx, acct, ns, root, cursor=None):
+    """(entries, cursor): the whole recursive listing of `root`, or everything since `cursor`. The cursor returned
+    continues exactly this listing, so each ticked root keeps its own (D10)."""
+    if cursor:
+        out = dropbox_call(cx, acct, ns, f"{DROPBOX_API}/files/list_folder/continue", {"cursor": cursor})["data"]
+    else:
+        out = dropbox_call(cx, acct, ns, f"{DROPBOX_API}/files/list_folder",
+                           {"path": root, "recursive": True, "limit": 2000})["data"]
+    entries = list(out.get("entries") or [])
+    while out.get("has_more"):
+        out = dropbox_call(cx, acct, ns, f"{DROPBOX_API}/files/list_folder/continue", {"cursor": out["cursor"]})["data"]
+        entries += out.get("entries") or []
+    return entries, out["cursor"]
+
+
+def dropbox_link(path_display):
+    """Where a citation opens the file: Dropbox's own preview of it inside its folder (D8). Built from the path, so
+    no sharing call per file; it opens for anyone signed in to the team, and a moved file's link heals on the walk."""
+    folder, _, name = path_display.rpartition("/")
+    return "https://www.dropbox.com/home" + urllib.parse.quote(folder) + "?preview=" + urllib.parse.quote(name, safe="")
+
+
+def dropbox_file(e):
+    """A listing entry in the shape the Drive code already writes."""
+    name = e["name"]
+    if e.get("is_downloadable", True):
+        mime = DROPBOX_TYPES.get(os.path.splitext(name)[1].lower()) or mimetypes.guess_type(name)[0] or "application/octet-stream"
+    else:
+        mime = DROPBOX_CLOUD
+    return {"id": e["path_lower"], "name": name, "mimeType": mime, "size": e.get("size"), "version": e["rev"],
+            "webViewLink": dropbox_link(e["path_display"])}
+
+
+def dropbox_download(cx, acct, ns, f):
+    """(filename, bytes, tags) for one file by its path. The proxy answers with a presigned link that lives about
+    an hour; a fetch that fails (or a link that has expired) asks for a new one."""
+    cloud = f["mimeType"] == DROPBOX_CLOUD
+    endpoint = f"{DROPBOX_CONTENT}/files/" + ("export" if cloud else "download")
+    err = None
+    for _ in range(3):
+        try:
+            out = dropbox_call(cx, acct, ns, endpoint, arg={"path": f["external_id"]})
+        except DropboxError as e:
+            if cloud and e.status == 409:
+                raise Skip(f"Dropbox can't export this file ({e.summary.rstrip('/') or 'no export'})")
+            raise
+        headers = {k.lower(): v for k, v in (out.get("headers") or {}).items()}
+        meta = json.loads(headers.get("dropbox-api-result") or "{}")
+        url = (out.get("binary_data") or {}).get("url")
+        if not url:
+            raise RuntimeError("Composio returned no file")
+        try:
+            r = requests.get(url, timeout=300)
+            r.raise_for_status()
+        except requests.RequestException as e:
+            err = e
+            continue
+        name = f["name"]
+        if cloud:
+            # The export names its own format (a Google Sheet comes back as .xlsx, Paper as .md).
+            name = (meta.get("export_metadata") or {}).get("name") or name
+            ext = os.path.splitext(name)[1].lower()
+            if ext not in INDEXED.values():
+                raise Skip(f"Dropbox exports this file as {ext or 'an unknown type'}, which isn't indexed yet")
+            meta = meta.get("file_metadata") or {}
+        elif name.lower().endswith(".tiff"):
+            name = name[:-1]  # RAGFlow knows images by extension, and its list has .tif but not .tiff
+        return name, r.content, {"modified_at": meta.get("server_modified") or ""}
+    raise RuntimeError(f"fetching the file failed: {err}")
+
+
+def indexable(mime, size, provider=None):
+    dropbox_only = provider == "dropbox" and (mime in IMAGES.values() or mime == DROPBOX_CLOUD)
+    if mime not in EXPORT and mime not in INDEXED and not dropbox_only:
         return "this file type isn't indexed yet"
     if size and size > MAX_BYTES:
         return "larger than 100 MB"
@@ -310,7 +464,7 @@ def upsert_file(db, org, corpus, provider, f, owner, keep=()):
     `keep`, because it has already decided the owner."""
     size = int(f["size"]) if f.get("size") else None
     revision = str(f.get("version") or f.get("modifiedTime") or "")
-    why_not = indexable(f["mimeType"], size)
+    why_not = indexable(f["mimeType"], size, provider)
     db.execute(
         """insert into documents (org_id, corpus_id, provider, external_id, name, mime_type, size, web_url,
                                   source_revision, state, last_error, connection_id, seen_at, updated_at)
@@ -505,6 +659,109 @@ def incremental(db, cx, org, corpus, provider, cid, acct, saved, live):
     return True
 
 
+def drop_under(db, org, corpus, provider, path, owners):
+    """Everything at or under `path` (a Dropbox `deleted` entry names a folder once, not each file in it), among
+    documents these connections own or nobody owns. Returns how many went."""
+    rows = db.execute("select external_id from documents where org_id = %s and corpus_id = %s and provider = %s "
+                      "and state <> 'removed' and (external_id = %s or starts_with(external_id, %s || '/')) "
+                      "and (connection_id is null or connection_id = any(%s::uuid[]))",
+                      (org, corpus, provider, path, path, list(owners))).fetchall()
+    return sum(drop_file(db, org, corpus, provider, external_id) for (external_id,) in rows)
+
+
+def dropbox_root(root):
+    """A ticked folder as Dropbox lists it and as the rows under it begin: lower case, no trailing slash, the
+    team root as ""."""
+    return root.rstrip("/").lower()
+
+
+def dropbox_group(db, cx, org, corpus, conns, state, keys):
+    """A Dropbox store, root by root (D10). A root with a cursor asks what changed since it; one without (new, reset,
+    due its weekly walk, or never finished) is listed in full, and only that complete listing removes what it did
+    not see under that root. Each root's rows and cursor are saved as soon as its listing ends, so a first walk
+    longer than the service's timeout still finishes over several passes. Returns the pass's (mode, folders,
+    files, missed)."""
+    provider = "dropbox"
+    live = list(conns)
+    walked_any, folders, files, missed = False, 0, 0, 0
+    everywhere = sorted({dropbox_root(r) for c in conns.values() for r in c["roots"]})
+    # A folder nobody has ticked any more: what was read from it (by a live connection, or by nobody) goes.
+    gone = db.execute(
+        "select external_id from documents d where org_id = %s and corpus_id = %s and provider = %s and state <> 'removed' "
+        "and (connection_id is null or connection_id = any(%s::uuid[])) and not exists (select 1 from unnest(%s::text[]) r "
+        "where d.external_id = r or starts_with(d.external_id, r || '/'))", (org, corpus, provider, live, everywhere)).fetchall()
+    for (external_id,) in gone:
+        drop_file(db, org, corpus, provider, external_id)
+    if gone:
+        log(f"plan: removed {len(gone)} file(s) no longer in the selection")
+        db.commit()
+    for cid in sorted(conns):
+        acct, roots = conns[cid]["acct"], sorted({dropbox_root(r) for r in conns[cid]["roots"]})
+        saved = state.get(keys[cid]) or {}
+        cursors = {r: c for r, c in (saved.get("cursors") or {}).items() if r in roots}
+        stamps = {r: t for r, t in (saved.get("walked") or {}).items() if r in roots}
+        if saved.get("walk"):
+            cursors = {}
+        saved = state[keys[cid]] = {"cursors": cursors, "walked": stamps, "roots": roots}
+        ns = None
+        for root in roots:
+            try:
+                if ns is None:  # once per connection per pass, and not at all for a connection with nothing ticked
+                    ns = dropbox_namespace(cx, acct)
+                cursor = cursors.get(root)
+                if cursor and time.time() - (stamps.get(root) or 0) <= FULL_WALK_SECONDS:
+                    try:
+                        entries, cursor = dropbox_list(cx, acct, ns, root, cursor)
+                        touched = 0
+                        for e in entries:  # in order: a move is its delete and then its add
+                            if e.get(".tag") == "deleted":
+                                touched += drop_under(db, org, corpus, provider, e["path_lower"], [cid])
+                            elif e.get(".tag") == "file":
+                                upsert_file(db, org, corpus, provider, dropbox_file(e), cid, live)
+                                touched += 1
+                        db.commit()
+                        cursors[root] = cursor
+                        save_sync(state)
+                        if entries:
+                            log(f"plan: connection {cid}: {root or '/'}: {len(entries)} change(s), {touched} file(s) touched")
+                        continue
+                    except DropboxError as e:
+                        if e.status != 409 or not e.summary.startswith("reset"):
+                            raise
+                        cursors.pop(root)
+                        log(f"plan: connection {cid}: Dropbox reset the cursor for {root or '/'}; listing it again")
+                # A full listing. The cursor it ends on covers everything after it.
+                entries, cursor = dropbox_list(cx, acct, ns, root)
+                seen = {}
+                for e in entries:
+                    if e.get(".tag") == "file":
+                        seen[e["path_lower"]] = dropbox_file(e)
+                    elif e.get(".tag") == "folder":
+                        folders += 1
+                if root in cursors:  # the feed was running: anything not held at this revision, it missed
+                    held = dict(db.execute(
+                        "select external_id, source_revision from documents where org_id = %s and corpus_id = %s and provider = %s "
+                        "and state <> 'removed' and external_id = any(%s::text[])", (org, corpus, provider, list(seen))).fetchall())
+                    missed += sum(1 for k, f in seen.items() if held.get(k) != f["version"])
+                for f in seen.values():
+                    upsert_file(db, org, corpus, provider, f, cid, live)
+                stale = db.execute(
+                    "select external_id from documents where org_id = %s and corpus_id = %s and provider = %s and state <> 'removed' "
+                    "and starts_with(external_id, %s || '/') and not (external_id = any(%s::text[])) "
+                    "and (connection_id is null or connection_id = %s)", (org, corpus, provider, root, list(seen), cid)).fetchall()
+                for (external_id,) in stale:
+                    drop_file(db, org, corpus, provider, external_id)
+                db.commit()
+                cursors[root], stamps[root] = cursor, time.time()
+                save_sync(state)
+                walked_any, files, folders = True, files + len(seen), folders + 1
+                log(f"plan: connection {cid}: walked {root or '/'}: {len(seen)} file(s)" + (f", removed {len(stale)}" if stale else ""))
+            except Exception as e:  # this root keeps what it had; nothing is removed on a failed listing
+                db.rollback()
+                log(f"plan: {provider}:{root or '/'} for connection {cid} failed: {e}")
+    return ("walk" if walked_any else "changes", folders, files, missed)
+
+
 def claim_unowned(db, org):
     """Documents written before this worker knew about owners (or by an older worker after the migration that added
     them) belong to the store's one live connection, when it has exactly one. With several, the next walk decides."""
@@ -531,10 +788,10 @@ def plan(db, cx, org):
     # the walk that follows is what takes its files out.
     for cid, user, account, corpus, provider in db.execute(
             "select id::text, composio_user_id, composio_connected_account_id, corpus_id::text, provider from corpus_connections "
-            "where org_id = %s and status = 'ACTIVE' and provider = 'googledrive'", (org,)).fetchall():
+            "where org_id = %s and status = 'ACTIVE' and provider in ('googledrive', 'dropbox')", (org,)).fetchall():
         stores.setdefault((corpus, provider), {})[cid] = {"acct": (user, account), "roots": []}
     for cid, user, account, corpus, provider, root in sources:
-        if provider != "googledrive":
+        if provider not in ("googledrive", "dropbox"):
             log(f"plan: no ingestion adapter for {provider} yet; skipping {root}")
             continue
         stores.setdefault((corpus, provider), {}).setdefault(cid, {"acct": (user, account), "roots": []})["roots"].append(root)
@@ -544,6 +801,9 @@ def plan(db, cx, org):
     for (corpus, provider), conns in stores.items():
         keys = {cid: f"{corpus}:{provider}:{cid}" for cid in conns}
         kept |= set(keys.values())
+        if provider == "dropbox":
+            ran.append(dropbox_group(db, cx, org, corpus, conns, state, keys))
+            continue
         old = f"{corpus}:{provider}"  # the one-connection key; carried over so the upgrade forces no full walk
         if old in state and len(conns) == 1 and next(iter(keys.values())) not in state:
             state[next(iter(keys.values()))] = state.pop(old)
@@ -597,20 +857,27 @@ def send(db, cx, org):
            where d.org_id = %s and d.state = 'pending' and c.status = 'ACTIVE'
            -- Documents an operator marked as wanted first (`npm run org -- priority`), then oldest waiting.
            order by d.priority desc, d.updated_at limit %s""", (org, BATCH)).fetchall()
-    started = []
+    started, namespaces = [], {}
     for doc_id, provider, ext_id, name, mime, web_url, revision, old_rf, attempts, acknowledged, user, account in rows:
         db.execute("update documents set state = 'uploading', updated_at = now() where id = %s", (doc_id,))
         db.commit()
         try:
-            filename, content = drive_download(cx, (user, account), {"external_id": ext_id, "name": name, "mimeType": mime}, acknowledged)
+            f = {"external_id": ext_id, "name": name, "mimeType": mime}
+            if provider == "dropbox":
+                if account not in namespaces:
+                    namespaces[account] = dropbox_namespace(cx, (user, account))
+                filename, content, extra = dropbox_download(cx, (user, account), namespaces[account], f)
+            else:
+                (filename, content), extra = drive_download(cx, (user, account), f, acknowledged), {}
             if old_rf:
                 rag.delete([old_rf])
             rf = rag.upload(filename, content)
             plain = mime == "application/pdf"
-            if plain:
-                rag.configure(rf, PLAIN)
+            ocr = mime in IMAGES.values()  # an image has no text layer to try first
+            if plain or ocr:
+                rag.configure(rf, PLAIN if plain else OCR)
             rag.tag(rf, {"provider": provider, "external_id": ext_id, "revision": revision, "web_url": web_url or "",
-                         "parse": "plain" if plain else "native"})
+                         "parse": "plain" if plain else "ocr" if ocr else "native", **extra})
             db.execute("update documents set state = 'parsing', ragflow_doc_id = %s, sent_revision = %s, last_error = null, updated_at = now() where id = %s",
                        (rf, revision, doc_id))
             started.append(rf)
