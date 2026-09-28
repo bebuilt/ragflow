@@ -5,7 +5,8 @@
 
 Needs psycopg and requests (the box has both). The database cases are skipped without INGEST_TEST_DSN. Each person's
 Drive is a fake account with its own folders; a Dropbox account is a fake team behind a fake Composio proxy; Composio,
-RAGFlow and the file download are fakes that record what was asked of them.
+RAGFlow and the file download are fakes that record what was asked of them. Onyx's text sidecar, when a case wants one,
+is written into the case's temporary directory.
 """
 import json
 import os
@@ -155,6 +156,9 @@ class FakeDropboxProxy:
                     return self.answer({"error": {".tag": "reset"}, "error_summary": "reset/"}, 409)
                 rest = self.changes.pop((account, root), [])
             return self.answer(self.page(root, rest))
+        if tail == "files/get_metadata":
+            f = next((e for e in team.values() if e["path_lower"] == body["path"]), None)
+            return self.answer(f) if f else self.answer({"error_summary": "path/not_found/"}, 409)
         path = json.loads(headers["Dropbox-API-Arg"])["path"]
         f = next((e for e in team.values() if e["path_lower"] == path), None)
         if f is None:
@@ -175,7 +179,7 @@ class FakeDropboxProxy:
 
 class FakeRAG:
     def __init__(self):
-        self.docs, self.n, self.uploads = {}, 0, []
+        self.docs, self.n, self.uploads, self.contents = {}, 0, [], {}
         self.tags, self.configs, self.deleted = {}, {}, []
 
     def queued(self):
@@ -186,6 +190,7 @@ class FakeRAG:
         rf = f"rf{self.n}"
         self.docs[rf] = {"id": rf, "run": "UNSTART"}
         self.uploads.append(filename)
+        self.contents[filename] = content
         return rf
 
     def configure(self, rf, parser_config):
@@ -232,6 +237,10 @@ class IngestTest(unittest.TestCase):
         ingest.PROGRESS_FILE = os.path.join(self.tmp, "progress.json")
         ingest.rag = self.rag = FakeRAG()
         ingest.BACKOFF = 0
+        ingest.ONYX_TEXT_DIR = os.path.join(self.tmp, "onyx-text")  # absent unless a case writes one
+        ingest.ONYX_EMPTY_FILE = os.path.join(self.tmp, "onyx-empty.json")
+        self.logged, self._log = [], ingest.log
+        ingest.log = lambda msg: (self.logged.append(msg), self._log(msg))
         self.fetched, self.expired = [], set()
         self._get = ingest.requests.get
         ingest.requests.get = self.fetch
@@ -240,6 +249,7 @@ class IngestTest(unittest.TestCase):
 
     def tearDown(self):
         ingest.requests.get = self._get
+        ingest.log = self._log
         self.db.close()
 
     def fetch(self, url, timeout=None):
@@ -646,6 +656,117 @@ class IngestTest(unittest.TestCase):
         self.assertEqual(self.cx.downloads(), [("org-ask", "ca_a")])
         self.assertEqual(self.dbx.tails().count("files/download"), 1)
         self.assertNotIn("modified_at", self.rag.tags[self.row("a1", "ragflow_doc_id")[0]], "Drive's tag is unchanged")
+
+    # --- Onyx's text ---
+    def onyx(self, entries):
+        """Onyx's sidecar: {path_lower: (rev, text)}, one .md per entry beside index.json."""
+        os.makedirs(ingest.ONYX_TEXT_DIR, exist_ok=True)
+        index = {}
+        for i, (path, (rev, text)) in enumerate(sorted(entries.items())):
+            index[path] = {"rev": rev, "file": f"{i}.md", "chunks": 1}
+            with open(os.path.join(ingest.ONYX_TEXT_DIR, f"{i}.md"), "w") as f:
+                f.write(f"# {path.rsplit('/', 1)[-1]}\n\n{text}")
+        with open(os.path.join(ingest.ONYX_TEXT_DIR, "index.json"), "w") as f:
+            json.dump(index, f)
+
+    def scans(self, *paths):
+        self.connect(A, UA, "org-ask", "ca_x", provider="dropbox")
+        self.dbx.teams["ca_x"] = {p: entry(p) for p in paths}
+        self.tick("/t", A, UA, provider="dropbox")
+
+    def finish(self, path, **parsed):
+        rf = self.row(path, "ragflow_doc_id")[0]
+        self.rag.docs[rf] = {"id": rf, **parsed, "meta_fields": self.rag.tags[rf]}
+        return rf
+
+    def sent_from_onyx(self, display, path):
+        self.scans(display)
+        self.onyx({path: ("1", "LEASE AGREEMENT between ...")})
+        self.run_pass()
+        name = display.rsplit("/", 1)[1]
+        self.assertNotIn("files/download", self.dbx.tails(), "no Dropbox download at all")
+        self.assertEqual(self.fetched, [])
+        self.assertEqual(self.rag.uploads, [f"{name}.md"])
+        self.assertEqual(self.rag.contents[f"{name}.md"], f"# {name.lower()}\n\nLEASE AGREEMENT between ...".encode())
+        rf = self.row(path, "ragflow_doc_id")[0]
+        self.assertEqual(self.rag.configs[rf], ingest.PLAIN)
+        self.assertEqual(self.rag.tags[rf], {"provider": "dropbox", "external_id": path, "revision": "1",
+                                             "web_url": ingest.dropbox_link(display),
+                                             "parse": "onyx", "modified_at": "2026-09-01T12:00:00Z"})
+        self.assertEqual(self.row(path, "state", "name", "source_revision", "sent_revision"), ("parsing", name, "1", "1"))
+        self.assertIn("send: 1 file(s) sent from Onyx text", self.logged)
+        self.finish(path, run="DONE", chunk_count=4)
+        ingest.reconcile(self.db, ORG)
+        self.assertEqual(self.row(path, "state", "indexed_revision", "chunk_count", "attempts"), ("indexed", "1", 4, 0))
+
+    def test_a_pdf_onyx_already_read_is_sent_as_its_text(self):
+        self.sent_from_onyx("/T/Lease 4.pdf", "/t/lease 4.pdf")
+
+    def test_an_image_onyx_already_read_is_sent_as_its_text_not_ocrd(self):
+        self.sent_from_onyx("/T/SOMA page.jpg", "/t/soma page.jpg")
+
+    def test_onyx_text_for_another_rev_is_not_used(self):
+        self.scans("/T/a.pdf")
+        self.onyx({"/t/a.pdf": ("0", "an older rev's text")})
+        self.run_pass()
+        self.assertEqual(self.dbx.tails().count("files/download"), 1)
+        self.assertEqual(self.rag.uploads, ["a.pdf"])
+        rf = self.row("/t/a.pdf", "ragflow_doc_id")[0]
+        self.assertEqual((self.rag.configs[rf], self.rag.tags[rf]["parse"]), (ingest.PLAIN, "plain"))
+        self.assertIn("send: 0 file(s) sent from Onyx text", self.logged)
+
+    def test_a_sidecar_directory_without_an_index_changes_nothing(self):
+        os.makedirs(ingest.ONYX_TEXT_DIR)
+        self.test_dropbox_images_go_straight_to_ocr()
+        self.assertFalse([m for m in self.logged if "Onyx" in m], "nothing said about a feature that is off")
+
+    def test_a_malformed_index_is_logged_and_everything_goes_the_usual_way(self):
+        self.scans("/T/a.pdf", "/T/b.jpg")
+        os.makedirs(ingest.ONYX_TEXT_DIR)
+        with open(os.path.join(ingest.ONYX_TEXT_DIR, "index.json"), "w") as f:
+            f.write('{"/t/a.pdf": {"rev": "1", "fi')
+        self.run_pass()
+        self.assertEqual(len([m for m in self.logged if "Onyx text index unreadable" in m]), 1)
+        self.assertEqual(sorted(self.rag.uploads), ["a.pdf", "b.jpg"])
+        self.assertEqual(self.rag.configs[self.row("/t/b.jpg", "ragflow_doc_id")[0]], ingest.OCR)
+
+    def test_onyx_text_that_parses_to_nothing_sends_the_file_itself_once(self):
+        self.scans("/T/scan.pdf", "/T/photo.jpg")
+        self.onyx({"/t/scan.pdf": ("1", " "), "/t/photo.jpg": ("1", " ")})
+        self.run_pass()
+        onyx_rfs = [self.finish(p, run="DONE", chunk_count=0) for p in ("/t/scan.pdf", "/t/photo.jpg")]
+        ingest.reconcile(self.db, ORG)
+        for path in ("/t/scan.pdf", "/t/photo.jpg"):
+            self.assertEqual(self.row(path, "state", "attempts"), ("pending", 0), f"{path}: not no_text, no attempt spent")
+        self.assertEqual(self.rag.configs[onyx_rfs[0]], ingest.PLAIN, "not escalated to OCR as a plain PDF would be")
+        self.run_pass()
+        self.assertEqual(self.dbx.tails().count("files/download"), 2, "the files themselves this time")
+        self.assertTrue(set(onyx_rfs) <= set(self.rag.deleted), "the empty text goes first")
+        pdf, img = self.row("/t/scan.pdf", "ragflow_doc_id")[0], self.row("/t/photo.jpg", "ragflow_doc_id")[0]
+        self.assertEqual((self.rag.configs[pdf], self.rag.tags[pdf]["parse"]), (ingest.PLAIN, "plain"))
+        self.assertEqual((self.rag.configs[img], self.rag.tags[img]["parse"]), (ingest.OCR, "ocr"))
+        # The usual rules from here: the PDF escalates to OCR, the image fails and is retried, still not from Onyx.
+        self.finish("/t/scan.pdf", run="DONE", chunk_count=0)
+        self.finish("/t/photo.jpg", run="FAIL", progress_msg="Read timed out. (read timeout=30)")
+        ingest.reconcile(self.db, ORG)
+        self.assertEqual((self.row("/t/scan.pdf", "state")[0], self.rag.configs[pdf]), ("parsing", ingest.OCR))
+        self.assertEqual(self.row("/t/photo.jpg", "state", "attempts"), ("pending", 1))
+        self.run_pass()
+        self.assertEqual(self.rag.uploads.count("photo.jpg.md"), 1, "Onyx's text was tried once")
+        self.assertEqual(self.rag.uploads.count("photo.jpg"), 2)
+        self.finish("/t/photo.jpg", run="DONE", chunk_count=0)
+        ingest.reconcile(self.db, ORG)
+        self.assertEqual(self.row("/t/photo.jpg", "state", "last_error"), ("skipped", "no_text"), "the file itself had no text")
+
+    def test_a_drive_file_is_never_sent_from_onyx_text(self):
+        self.connect(A, UA, "org-ask", "ca_a")
+        self.cx.drives["ca_a"] = {"FA": [file("a1")]}
+        self.tick("FA", A, UA)
+        self.onyx({"a1": ("1", "text")})
+        self.run_pass()
+        self.assertEqual(self.cx.downloads(), [("org-ask", "ca_a")])
+        self.assertEqual(self.rag.uploads, ["a1.pdf"])
+        self.assertEqual(self.rag.tags[self.row("a1", "ragflow_doc_id")[0]]["parse"], "plain")
 
 
 class _Answer:

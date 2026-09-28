@@ -5,7 +5,7 @@
 Config, all this client's own (the box leaves our hands; nothing here reaches another client):
     /etc/bebuilt/worker.env         WORKER_DB_URL (worker_<slug>: RLS admits this org's rows only),
                                     ORG_ID, COMPOSIO_API_KEY, COMPOSIO_USER_ID (only for a connection that
-                                    records no identity of its own)
+                                    records no identity of its own), ONYX_TEXT_DIR (optional, below)
 
 Stores are Google Drive or Dropbox (2026-09-28). A Dropbox store is keyed by path (`external_id = path_lower`) and
 read through Composio's proxy to the raw API, because Composio's Dropbox tools cannot continue a listing or download.
@@ -120,6 +120,12 @@ DROPBOX_TYPES = {**{ext: mime for mime, ext in INDEXED.items()}, ".htm": "text/h
 # A Dropbox cloud doc (Google Docs/Sheets/Slides or Paper kept in Dropbox) has no bytes of its own; a plain download
 # answers with an HTML stub (Onyx's override, 2025). It is recorded under this type and exported instead.
 DROPBOX_CLOUD = "application/vnd.dropbox.cloud-doc"
+# CDC's scans were read once already, by Onyx (unstructured.io hi_res), and OCR here costs ~6 s a page. That text sits
+# on the box as a sidecar: index.json {path_lower: {rev, file, chunks}} and the .md files beside it. A Dropbox PDF or
+# image whose rev the index names is sent as that text, parsed plain, and never downloaded; any other rev, or no index
+# at all, goes the usual way. Text that parses to nothing sends the file itself instead, once per rev.
+ONYX_TEXT_DIR = os.environ.get("ONYX_TEXT_DIR", "/var/lib/bebuilt/onyx-text")
+ONYX_EMPTY_FILE = "/var/lib/bebuilt/onyx-empty.json"  # {path_lower: rev} whose Onyx text parsed to nothing
 
 
 def log(msg):
@@ -448,6 +454,41 @@ def dropbox_download(cx, acct, ns, f):
             name = name[:-1]  # RAGFlow knows images by extension, and its list has .tif but not .tiff
         return name, r.content, {"modified_at": meta.get("server_modified") or ""}
     raise RuntimeError(f"fetching the file failed: {err}")
+
+
+def dropbox_modified(cx, acct, ns, f):
+    """The tag a download reads from its headers, for a file sent without downloading it."""
+    out = dropbox_call(cx, acct, ns, f"{DROPBOX_API}/files/get_metadata", {"path": f["external_id"]})
+    return {"modified_at": (out.get("data") or {}).get("server_modified") or ""}
+
+
+def load_onyx():
+    """The Onyx sidecar's index, or None: no sidecar (the feature is off), or one that can't be read (off this pass)."""
+    path = os.path.join(ONYX_TEXT_DIR, "index.json")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as f:
+            index = json.load(f)
+        if not isinstance(index, dict):
+            raise ValueError("not a JSON object")
+        return index
+    except (OSError, ValueError) as e:
+        log(f"send: Onyx text index unreadable ({e}); every file goes the usual way this pass")
+        return None
+
+
+def onyx_text(index, f, revision):
+    """(filename, bytes) of Onyx's text for exactly this rev, or None. Named `<name>.md`, so RAGFlow reads it as text."""
+    entry = index.get(f["external_id"])
+    if not isinstance(entry, dict) or entry.get("rev") != revision or not entry.get("file"):
+        return None
+    try:
+        with open(os.path.join(ONYX_TEXT_DIR, os.path.basename(entry["file"])), "rb") as t:
+            return f"{f['name']}.md", t.read()
+    except OSError as e:
+        log(f"send: {f['name']}: no Onyx text file ({e}); downloading it instead")
+        return None
 
 
 def indexable(mime, size, provider=None):
@@ -862,29 +903,37 @@ def send(db, cx, org):
            -- Documents an operator marked as wanted first (`npm run org -- priority`), then oldest waiting.
            order by d.priority desc, d.updated_at limit %s""", (org, BATCH)).fetchall()
     started, namespaces = [], {}
+    onyx, from_onyx = load_onyx(), 0
+    empties = load_empties() if onyx else {}
     for doc_id, provider, ext_id, name, mime, web_url, revision, old_rf, attempts, acknowledged, user, account in rows:
         db.execute("update documents set state = 'uploading', updated_at = now() where id = %s", (doc_id,))
         db.commit()
         try:
             f = {"external_id": ext_id, "name": name, "mimeType": mime}
+            # A PDF tries its text layer first; an image has none to try.
+            parse = "plain" if mime == "application/pdf" else "ocr" if mime in IMAGES.values() else "native"
             if provider == "dropbox":
                 if account not in namespaces:
                     namespaces[account] = dropbox_namespace(cx, (user, account))
-                filename, content, extra = dropbox_download(cx, (user, account), namespaces[account], f)
+                text = onyx_text(onyx, f, revision) if onyx and parse != "native" and empties.get(ext_id) != revision else None
+                if text:  # Onyx read this very rev already: its text goes instead of the file, which stays the citation
+                    (filename, content), extra = text, dropbox_modified(cx, (user, account), namespaces[account], f)
+                    parse = "onyx"
+                else:
+                    filename, content, extra = dropbox_download(cx, (user, account), namespaces[account], f)
             else:
                 (filename, content), extra = drive_download(cx, (user, account), f, acknowledged), {}
             if old_rf:
                 rag.delete([old_rf])
             rf = rag.upload(filename, content)
-            plain = mime == "application/pdf"
-            ocr = mime in IMAGES.values()  # an image has no text layer to try first
-            if plain or ocr:
-                rag.configure(rf, PLAIN if plain else OCR)
+            if parse != "native":
+                rag.configure(rf, OCR if parse == "ocr" else PLAIN)
             rag.tag(rf, {"provider": provider, "external_id": ext_id, "revision": revision, "web_url": web_url or "",
-                         "parse": "plain" if plain else "ocr" if ocr else "native", **extra})
+                         "parse": parse, **extra})
             db.execute("update documents set state = 'parsing', ragflow_doc_id = %s, sent_revision = %s, last_error = null, updated_at = now() where id = %s",
                        (rf, revision, doc_id))
             started.append(rf)
+            from_onyx += parse == "onyx"
         except Skip as e:
             db.execute("update documents set state = 'skipped', last_error = %s, updated_at = now() where id = %s", (str(e), doc_id))
         except Blocked as e:
@@ -897,6 +946,8 @@ def send(db, cx, org):
                        (state, str(e)[:500], doc_id))
             log(f"send: {name}: {e}")
         db.commit()
+    if onyx is not None:
+        log(f"send: {from_onyx} file(s) sent from Onyx text")
     if started:
         rag.parse(started)
         log(f"send: {len(started)} file(s) uploaded and parsing")
@@ -911,16 +962,16 @@ def reconcile(db, org):
     except Exception as e:
         log(f"reconcile: skipped, {e}")
         return
-    rows = db.execute("select id, name, state, ragflow_doc_id, sent_revision, source_revision, mime_type from documents "
+    rows = db.execute("select id, name, state, ragflow_doc_id, sent_revision, source_revision, mime_type, external_id from documents "
                       "where org_id = %s and ragflow_doc_id is not null", (org,)).fetchall()
-    marks, now = load_progress(), time.time()
+    marks, now, empties = load_progress(), time.time(), load_empties()
     running = set()
     orphans = [rf for rf in held if rf not in {r[3] for r in rows}]
     if orphans:
         rag.delete(orphans)
         log(f"reconcile: deleted {len(orphans)} RAGFlow document(s) no record refers to")
-    escalated = 0
-    for doc_id, name, state, rf, sent, current, mime in rows:
+    escalated, fell_back = 0, 0
+    for doc_id, name, state, rf, sent, current, mime, ext_id in rows:
         d = held.get(rf)
         if d is None:
             db.execute("update documents set state = 'pending', ragflow_doc_id = null, last_error = 'gone from RAGFlow', updated_at = now() "
@@ -930,6 +981,14 @@ def reconcile(db, org):
             continue
         run = str(d.get("run"))
         meta = d.get("meta_fields") or {}
+        if run in ("DONE", "3") and not d.get("chunk_count") and meta.get("parse") == "onyx":
+            # Onyx's text held nothing to index. That says nothing yet about the file, so it goes the usual way next
+            # send (a PDF plain then OCR, an image OCR), once for this rev, with no attempt spent.
+            empties[ext_id] = sent
+            db.execute("update documents set state = 'pending', last_error = 'Onyx text parsed to nothing; reading the file itself', "
+                       "updated_at = now() where id = %s", (doc_id,))
+            fell_back += 1
+            continue
         if run in ("DONE", "3") and mime == "application/pdf" and not d.get("chunk_count") and meta.get("parse") == "plain":
             # Nothing came out of the text layer: this one really is a scan, so it earns the slow parser.
             try:
@@ -940,8 +999,9 @@ def reconcile(db, org):
             except Exception as e:
                 log(f"reconcile: sending {name} to OCR failed: {e}")
             continue
-        if mime in IMAGES.values() and (run in ("DONE", "3") and not d.get("chunk_count") or run in ("FAIL", "4")
-                                        and any(m in (d.get("progress_msg") or "") for m in NO_VISION)):
+        if mime in IMAGES.values() and meta.get("parse") != "onyx" and (
+                run in ("DONE", "3") and not d.get("chunk_count")
+                or run in ("FAIL", "4") and any(m in (d.get("progress_msg") or "") for m in NO_VISION)):
             # Recorded against what was sent, like an indexed file, so only a new revision sends it again.
             db.execute("update documents set state = 'skipped', last_error = 'no_text', indexed_revision = %s, chunk_count = 0, "
                        "updated_at = now() where id = %s", (sent, doc_id))
@@ -978,8 +1038,12 @@ def reconcile(db, org):
                 running.add(rf)
     if escalated:
         log(f"reconcile: {escalated} scanned PDF(s) sent through OCR")
+    if fell_back:
+        log(f"reconcile: {fell_back} file(s) whose Onyx text parsed to nothing go the usual way")
     db.commit()
     save_progress({rf: m for rf, m in marks.items() if rf in running})
+    if fell_back:
+        save_empties(empties)
 
 
 def retry(db, doc_id, why):
@@ -1004,6 +1068,22 @@ def save_progress(marks):
     os.replace(tmp, PROGRESS_FILE)
 
 
+def load_empties():
+    try:
+        with open(ONYX_EMPTY_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_empties(empties):
+    os.makedirs(os.path.dirname(ONYX_EMPTY_FILE), exist_ok=True)
+    tmp = ONYX_EMPTY_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(empties, f)
+    os.replace(tmp, ONYX_EMPTY_FILE)
+
+
 def main():
     lock = open("/run/bebuilt-ingest.lock", "w")
     try:
@@ -1013,7 +1093,8 @@ def main():
         return
     cfg = load_env("/etc/bebuilt/worker.env")
     tenant = json.load(open("/etc/bebuilt/ragflow-tenant.json"))
-    global rag
+    global rag, ONYX_TEXT_DIR
+    ONYX_TEXT_DIR = cfg.get("ONYX_TEXT_DIR") or ONYX_TEXT_DIR
     rag = RAGFlow(tenant["api_key"], tenant["dataset_id"])
     cx = Composio(cfg["COMPOSIO_API_KEY"], cfg.get("COMPOSIO_USER_ID"))
     org = cfg["ORG_ID"]
