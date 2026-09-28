@@ -121,7 +121,7 @@ DROPBOX_TYPES = {**{ext: mime for mime, ext in INDEXED.items()}, ".htm": "text/h
 # answers with an HTML stub (Onyx's override, 2025). It is recorded under this type and exported instead.
 DROPBOX_CLOUD = "application/vnd.dropbox.cloud-doc"
 # CDC's scans were read once already, by Onyx (unstructured.io hi_res), and OCR here costs ~6 s a page. That text sits
-# on the box as a sidecar: index.json {path_lower: {rev, file, chunks}} and the .md files beside it. A Dropbox PDF or
+# on the box as a sidecar: index.json {path_lower: {rev, modified, file, chunks}} and the .md files beside it. A Dropbox PDF or
 # image whose rev the index names is sent as that text, parsed plain, and never downloaded; any other rev, or no index
 # at all, goes the usual way. Text that parses to nothing sends the file itself instead, once per rev.
 ONYX_TEXT_DIR = os.environ.get("ONYX_TEXT_DIR", "/var/lib/bebuilt/onyx-text")
@@ -479,13 +479,14 @@ def load_onyx():
 
 
 def onyx_text(index, f, revision):
-    """(filename, bytes) of Onyx's text for exactly this rev, or None. Named `<name>.md`, so RAGFlow reads it as text."""
+    """(filename, bytes, tags) of Onyx's text for exactly this rev, or None. Named `<name>.md`, so RAGFlow reads it as
+    text. The index was built from the listing that gave the rev, so its `modified` is that rev's server_modified."""
     entry = index.get(f["external_id"])
     if not isinstance(entry, dict) or entry.get("rev") != revision or not entry.get("file"):
         return None
     try:
         with open(os.path.join(ONYX_TEXT_DIR, os.path.basename(entry["file"])), "rb") as t:
-            return f"{f['name']}.md", t.read()
+            return f"{f['name']}.md", t.read(), {"modified_at": entry["modified"]} if entry.get("modified") else None
     except OSError as e:
         log(f"send: {f['name']}: no Onyx text file ({e}); downloading it instead")
         return None
@@ -917,7 +918,8 @@ def send(db, cx, org):
                     namespaces[account] = dropbox_namespace(cx, (user, account))
                 text = onyx_text(onyx, f, revision) if onyx and parse != "native" and empties.get(ext_id) != revision else None
                 if text:  # Onyx read this very rev already: its text goes instead of the file, which stays the citation
-                    (filename, content), extra = text, dropbox_modified(cx, (user, account), namespaces[account], f)
+                    filename, content, extra = text
+                    extra = extra or dropbox_modified(cx, (user, account), namespaces[account], f)  # an entry without `modified`
                     parse = "onyx"
                 else:
                     filename, content, extra = dropbox_download(cx, (user, account), namespaces[account], f)

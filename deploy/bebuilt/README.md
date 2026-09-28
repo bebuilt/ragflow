@@ -59,7 +59,7 @@ Rules this directory keeps:
   vision model (`No default vision model is set.`), ends `skipped` with `last_error = 'no_text'` at once, no attempts
   spent, and is sent again only when its Dropbox rev changes; the cutover diff lists it as `skipped:no_text`.
 - **A scan Onyx already read is indexed from Onyx's text** (Dropbox stores, CDC). `ONYX_TEXT_DIR` (in `worker.env`,
-  default `/var/lib/bebuilt/onyx-text`) holds Onyx's sidecar: `index.json` (`{path_lower: {rev, file, chunks}}`) and
+  default `/var/lib/bebuilt/onyx-text`) holds Onyx's sidecar: `index.json` (`{path_lower: {rev, modified, file, chunks}}`) and
   the `.md` files beside it. A PDF or image whose Dropbox rev the index names is uploaded as `<name>.md`, parsed plain,
   tagged `parse: onyx`, and never downloaded or OCR'd; citations still open the Dropbox file. Another rev, or no
   index, goes the usual way; a malformed index is one log line and the usual way for that pass. Text that parses to

@@ -658,12 +658,15 @@ class IngestTest(unittest.TestCase):
         self.assertNotIn("modified_at", self.rag.tags[self.row("a1", "ragflow_doc_id")[0]], "Drive's tag is unchanged")
 
     # --- Onyx's text ---
-    def onyx(self, entries):
-        """Onyx's sidecar: {path_lower: (rev, text)}, one .md per entry beside index.json."""
+    def onyx(self, entries, modified=True):
+        """Onyx's sidecar: {path_lower: (rev, text)}, one .md per entry beside index.json; `modified` as the listing
+        entry() reports it, unless the case wants an index without it."""
         os.makedirs(ingest.ONYX_TEXT_DIR, exist_ok=True)
         index = {}
         for i, (path, (rev, text)) in enumerate(sorted(entries.items())):
             index[path] = {"rev": rev, "file": f"{i}.md", "chunks": 1}
+            if modified:
+                index[path]["modified"] = f"2026-09-0{rev}T12:00:00Z"
             with open(os.path.join(ingest.ONYX_TEXT_DIR, f"{i}.md"), "w") as f:
                 f.write(f"# {path.rsplit('/', 1)[-1]}\n\n{text}")
         with open(os.path.join(ingest.ONYX_TEXT_DIR, "index.json"), "w") as f:
@@ -679,12 +682,14 @@ class IngestTest(unittest.TestCase):
         self.rag.docs[rf] = {"id": rf, **parsed, "meta_fields": self.rag.tags[rf]}
         return rf
 
-    def sent_from_onyx(self, display, path):
+    def sent_from_onyx(self, display, path, modified=True):
         self.scans(display)
-        self.onyx({path: ("1", "LEASE AGREEMENT between ...")})
+        self.onyx({path: ("1", "LEASE AGREEMENT between ...")}, modified)
         self.run_pass()
         name = display.rsplit("/", 1)[1]
         self.assertNotIn("files/download", self.dbx.tails(), "no Dropbox download at all")
+        self.assertEqual(self.dbx.tails().count("files/get_metadata"), 0 if modified else 1,
+                         "modified_at from the index; asked of Dropbox only when the entry lacks it")
         self.assertEqual(self.fetched, [])
         self.assertEqual(self.rag.uploads, [f"{name}.md"])
         self.assertEqual(self.rag.contents[f"{name}.md"], f"# {name.lower()}\n\nLEASE AGREEMENT between ...".encode())
@@ -704,6 +709,9 @@ class IngestTest(unittest.TestCase):
 
     def test_an_image_onyx_already_read_is_sent_as_its_text_not_ocrd(self):
         self.sent_from_onyx("/T/SOMA page.jpg", "/t/soma page.jpg")
+
+    def test_an_index_entry_without_modified_asks_dropbox_for_it(self):
+        self.sent_from_onyx("/T/Lease 4.pdf", "/t/lease 4.pdf", modified=False)
 
     def test_onyx_text_for_another_rev_is_not_used(self):
         self.scans("/T/a.pdf")
