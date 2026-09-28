@@ -267,7 +267,7 @@ def drive_walk(cx, acct, root):
     """Every file under `root` (breadth-first, paged). Returns (files, folders, complete)."""
     seen, files, queue, complete = {root}, {}, [root], True
     folders = {root}
-    fields = "nextPageToken,incompleteSearch,files(id,name,mimeType,size,modifiedTime,version,webViewLink,shortcutDetails)"
+    fields = "nextPageToken,incompleteSearch,files(id,name,mimeType,size,modifiedTime,version,md5Checksum,webViewLink,shortcutDetails)"
     while queue:
         folder = queue.pop(0)
         token = None
@@ -304,7 +304,7 @@ def drive_start_token(cx, acct):
 def drive_changes(cx, acct, token):
     """(changes, next token) for everything this account can see that changed since `token`."""
     fields = ("nextPageToken,newStartPageToken,changes(removed,fileId,file(id,name,mimeType,size,modifiedTime,"
-              "version,webViewLink,parents,trashed,shortcutDetails))")
+              "version,md5Checksum,webViewLink,parents,trashed,shortcutDetails))")
     changes = []
     while True:
         page = cx.run(acct, "GOOGLEDRIVE_LIST_CHANGES", {
@@ -503,36 +503,68 @@ def indexable(mime, size, provider=None):
 
 # --- the pass -----------------------------------------------------------------------------------------
 
+def file_revision(provider, f):
+    """What a file's content is, so that only new content re-queues it. Dropbox: its `rev`, which moves only with
+    the content. Drive: its checksum, or for Google's own formats (which have none) when it was last modified. Not
+    Drive's `version`: Drive raises that for sharing, comments and other changes to the file's metadata too, and the
+    changes feed of a person the file was shared with never reports those, so every weekly walk counted and
+    re-parsed files nobody had touched (2026-09-28: 455 at Molzer, vendor catalogs last edited in 2024)."""
+    if provider == "dropbox":
+        return str(f.get("version") or "")
+    return str(f.get("md5Checksum") or f.get("modifiedTime") or f.get("version") or "")
+
+
+def legacy_revision(provider, f):
+    """The revision the worker recorded for this file before `file_revision` (Drive's `version`), or None when
+    there is nothing to carry over. A row still holding the file's CURRENT version has not changed since it was
+    recorded, so it takes the new revision in place instead of being parsed again: the switch is self-limiting,
+    since a row holds a version only until the first pass that sees its file."""
+    old = str(f.get("version") or "")
+    return old if provider != "dropbox" and old and old != file_revision(provider, f) else None
+
+
+def same_revision(held, provider, f):
+    """Whether a revision we hold is this file as it is now (in either form; see `legacy_revision`)."""
+    return held is not None and held in (file_revision(provider, f), legacy_revision(provider, f))
+
+
 def upsert_file(db, org, corpus, provider, f, owner, keep=()):
     """One Drive file into `documents`: new work becomes pending, a moved revision re-queues, a kind we
     cannot read is recorded as skipped so the screens can say why. `owner` is the connection it is read through;
     an existing owner listed in `keep` (the live connections, from a changes feed) stays. A group walk passes no
-    `keep`, because it has already decided the owner."""
+    `keep`, because it has already decided the owner. A revision recorded as the file's current Drive `version`
+    is carried over to its content revision first (`legacy_revision`), so the switch re-queues nothing."""
     size = int(f["size"]) if f.get("size") else None
-    revision = str(f.get("version") or f.get("modifiedTime") or "")
     why_not = indexable(f["mimeType"], size, provider)
+    # The stored revisions, as they would read had they been recorded in today's form.
+    held = {col: f"case when documents.{col} = %(legacy)s then %(revision)s else documents.{col} end"
+            for col in ("source_revision", "indexed_revision", "sent_revision")}
     db.execute(
-        """insert into documents (org_id, corpus_id, provider, external_id, name, mime_type, size, web_url,
+        f"""insert into documents (org_id, corpus_id, provider, external_id, name, mime_type, size, web_url,
                                   source_revision, state, last_error, connection_id, seen_at, updated_at)
-           values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())
+           values (%(org)s, %(corpus)s, %(provider)s, %(id)s, %(name)s, %(mime)s, %(size)s, %(url)s,
+                   %(revision)s, %(state)s, %(why_not)s, %(owner)s, now(), now())
            on conflict (corpus_id, provider, external_id) do update set
-             connection_id = case when documents.connection_id = any(%s::uuid[]) then documents.connection_id
+             connection_id = case when documents.connection_id = any(%(keep)s::uuid[]) then documents.connection_id
                                   else excluded.connection_id end,
              name = excluded.name, mime_type = excluded.mime_type, size = excluded.size,
              web_url = excluded.web_url, source_revision = excluded.source_revision, seen_at = now(),
+             indexed_revision = {held["indexed_revision"]}, sent_revision = {held["sent_revision"]},
              state = case
                when excluded.state = 'skipped' then 'skipped'
                when documents.state = 'removed' then 'pending'
-               when documents.indexed_revision is distinct from excluded.source_revision
+               when {held["indexed_revision"]} is distinct from excluded.source_revision
                     and documents.state in ('indexed', 'skipped') then 'pending'
-               when documents.state = 'failed' and documents.source_revision is distinct from excluded.source_revision then 'pending'
+               when documents.state = 'failed' and {held["source_revision"]} is distinct from excluded.source_revision then 'pending'
                when documents.state = 'failed' and documents.attempts < 3 then 'pending'
                else documents.state end,
-             attempts = case when documents.source_revision is distinct from excluded.source_revision then 0 else documents.attempts end,
+             attempts = case when {held["source_revision"]} is distinct from excluded.source_revision then 0 else documents.attempts end,
              last_error = case when excluded.state = 'skipped' then excluded.last_error else documents.last_error end,
              updated_at = now()""",
-        (org, corpus, provider, f["id"], f["name"], f["mimeType"], size, f.get("webViewLink"), revision,
-         "skipped" if why_not else "pending", why_not, owner, list(keep)))
+        {"org": org, "corpus": corpus, "provider": provider, "id": f["id"], "name": f["name"], "mime": f["mimeType"],
+         "size": size, "url": f.get("webViewLink"), "revision": file_revision(provider, f),
+         "legacy": legacy_revision(provider, f), "state": "skipped" if why_not else "pending", "why_not": why_not,
+         "owner": owner, "keep": list(keep)})
 
 
 def drop_file(db, org, corpus, provider, external_id):
@@ -609,7 +641,7 @@ def walk_group(db, cx, org, corpus, provider, conns, state, keys):
     missed = 0
     if count_missed:
         for external_id, (f, _) in seen.items():
-            if (held.get(external_id) or (None, None))[0] != str(f.get("version") or f.get("modifiedTime") or ""):
+            if not same_revision((held.get(external_id) or (None, None))[0], provider, f):
                 missed += 1
     for external_id, (f, saw) in seen.items():
         current = (held.get(external_id) or (None, None))[1]

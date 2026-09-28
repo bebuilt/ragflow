@@ -55,8 +55,10 @@ UA, UB = str(uuid.uuid4()), str(uuid.uuid4())
 PDF = "application/pdf"
 
 
-def file(fid, rev="1"):
-    return {"id": fid, "name": f"{fid}.pdf", "mimeType": PDF, "size": "10", "version": rev, "webViewLink": f"https://drive/{fid}"}
+def file(fid, rev="1", md5=None):
+    """A Drive file. Without `md5` its revision falls back to `version`, as the older cases expect."""
+    return {"id": fid, "name": f"{fid}.pdf", "mimeType": PDF, "size": "10", "version": rev, "webViewLink": f"https://drive/{fid}",
+            **({"md5Checksum": md5} if md5 else {})}
 
 
 class FakeComposio:
@@ -389,6 +391,84 @@ class IngestTest(unittest.TestCase):
         self.cx.changes["ca_a"] = [{"fileId": "a1", "file": {**file("a1"), "trashed": True, "parents": ["FA"]}}]
         self.run_pass()
         self.assertEqual(self.docs()["a1"][0], "removed")
+
+    # --- a Drive file's revision is its content, not Drive's `version` ---
+    def one_drive(self, *files):
+        """One person, one folder, these files, walked once and parsed; the uploads so far are forgotten."""
+        self.connect(A, UA, "org-ask", "ca_a")
+        self.cx.drives["ca_a"] = {"FA": list(files)}
+        self.tick("FA", A, UA)
+        self.run_pass()
+        self.parsed()
+        self.rag.uploads.clear()
+        self.cx.calls.clear()
+
+    def parsed(self):
+        self.db.execute("update documents set state = 'indexed', sent_revision = source_revision, indexed_revision = source_revision")
+        self.db.commit()
+
+    def last_walk_missed(self):
+        return self.db.execute("select missed from ingest_runs where mode = 'walk' order by at desc limit 1").fetchone()[0]
+
+    def test_a_version_bump_without_new_content_is_neither_parsed_again_nor_missed(self):
+        self.one_drive(file("a1", md5="m1"))
+        self.cx.drives["ca_a"]["FA"] = [file("a1", rev="9", md5="m1")]  # shared, commented on: Drive moves `version`
+        self.force_walk()
+        self.run_pass()
+        self.assertEqual(self.row("a1", "state", "source_revision", "indexed_revision"), ("indexed", "m1", "m1"))
+        self.assertEqual(self.rag.uploads, [])
+        self.assertEqual(self.last_walk_missed(), 0)
+
+    def test_new_content_is_parsed_again_and_a_walk_counts_it_when_the_feed_did_not(self):
+        self.one_drive(file("a1", md5="m1"))
+        self.cx.drives["ca_a"]["FA"] = [file("a1", rev="2", md5="m2")]
+        self.force_walk()
+        self.run_pass()
+        self.assertEqual(self.row("a1", "state", "source_revision", "sent_revision"), ("parsing", "m2", "m2"))
+        self.assertEqual(len(self.rag.uploads), 1)
+        self.assertEqual(self.last_walk_missed(), 1)
+
+    def test_a_google_doc_has_no_checksum_so_its_last_edit_is_its_revision(self):
+        doc = {**file("d1"), "mimeType": "application/vnd.google-apps.document", "name": "d1"}
+        self.one_drive({**doc, "modifiedTime": "2026-09-01T00:00:00Z"})
+        self.assertEqual(self.row("d1", "source_revision")[0], "2026-09-01T00:00:00Z")
+        self.cx.changes["ca_a"] = [{"fileId": "d1", "file": {**doc, "version": "5", "modifiedTime": "2026-09-01T00:00:00Z", "parents": ["FA"]}}]
+        self.run_pass()
+        self.assertEqual(self.row("d1", "state")[0], "indexed", "a version bump alone")
+        self.cx.changes["ca_a"] = [{"fileId": "d1", "file": {**doc, "version": "6", "modifiedTime": "2026-09-02T00:00:00Z", "parents": ["FA"]}}]
+        self.run_pass()
+        self.assertEqual(self.row("d1", "state", "sent_revision"), ("parsing", "2026-09-02T00:00:00Z"))
+
+    def test_rows_recorded_under_drives_version_carry_over_and_only_a_moved_version_is_parsed(self):
+        """The first walk after the switch: every row holds the `version` it was recorded at. One still at the file's
+        current version cannot have new content and takes the checksum in place; one behind it might, so it goes."""
+        self.one_drive(file("same", rev="7", md5="m1"), file("moved", rev="9", md5="m2"), file("parsing", rev="4", md5="m3"))
+        self.db.execute("update documents set source_revision = '7', sent_revision = '7', indexed_revision = '7' where external_id = 'same'")
+        self.db.execute("update documents set source_revision = '5', sent_revision = '5', indexed_revision = '5' where external_id = 'moved'")
+        self.db.execute("update documents set state = 'parsing', source_revision = '4', sent_revision = '4', indexed_revision = '3' "
+                        "where external_id = 'parsing'")
+        self.db.commit()
+        self.force_walk()
+        self.run_pass()
+        self.assertEqual(self.row("same", "state", "source_revision", "sent_revision", "indexed_revision"), ("indexed", "m1", "m1", "m1"))
+        self.assertEqual(self.row("moved", "state", "source_revision"), ("parsing", "m2"))
+        self.assertEqual(self.row("parsing", "state", "source_revision", "sent_revision", "indexed_revision"), ("parsing", "m3", "m3", "3"),
+                         "what is in flight is recognised when it lands")
+        self.assertEqual(len(self.rag.uploads), 1)
+        self.assertEqual(self.last_walk_missed(), 1, "only the row behind the file's version")
+        self.force_walk()
+        self.run_pass()
+        self.assertEqual(self.row("same", "source_revision")[0], "m1", "carried over once, then held in today's form")
+
+    def test_the_feed_carries_a_row_over_the_same_way(self):
+        self.one_drive(file("a1", rev="7", md5="m1"))
+        self.db.execute("update documents set source_revision = '7', sent_revision = '7', indexed_revision = '7'")
+        self.db.commit()
+        self.cx.changes["ca_a"] = [{"fileId": "a1", "file": {**file("a1", rev="7", md5="m1"), "parents": ["FA"]}}]
+        self.run_pass()
+        self.assertFalse(self.walked())
+        self.assertEqual(self.row("a1", "state", "source_revision", "indexed_revision"), ("indexed", "m1", "m1"))
+        self.assertEqual(self.rag.uploads, [])
 
     def test_a_dead_connections_documents_stay(self):
         self.two_people()
