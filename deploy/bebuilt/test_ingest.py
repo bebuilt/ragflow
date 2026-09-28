@@ -79,6 +79,9 @@ class FakeComposio:
             if account in self.fail:
                 raise RuntimeError("listing failed")
             return {"files": list(drive.get(args["folder_id"], []))}
+        if slug == "GOOGLEDRIVE_GET_FILE_METADATA":  # only ever asked for My Drive's real id
+            assert args == {"fileId": "root", "fields": "id"}, args
+            return {"id": f"mydrive-{account}"}
         if slug == "GOOGLEDRIVE_GET_CHANGES_START_PAGE_TOKEN":
             self.tokens += 1
             return {"startPageToken": f"t{self.tokens}"}
@@ -459,6 +462,19 @@ class IngestTest(unittest.TestCase):
         self.force_walk()
         self.run_pass()
         self.assertEqual(self.row("same", "source_revision")[0], "m1", "carried over once, then held in today's form")
+
+    def test_a_file_saved_straight_into_my_drive_arrives_through_the_feed(self):
+        """Someone who ticked all of My Drive ticked Drive's alias `root`; the feed names the real id as the parent."""
+        self.connect(A, UA, "org-ask", "ca_a")
+        self.cx.drives["ca_a"] = {"root": [file("a1")]}
+        self.tick("root", A, UA)
+        self.run_pass()
+        self.cx.calls.clear()
+        self.cx.drives["ca_a"]["root"].append(file("new"))
+        self.cx.changes["ca_a"] = [{"fileId": "new", "file": {**file("new"), "parents": ["mydrive-ca_a"]}}]
+        self.run_pass()
+        self.assertFalse(self.walked())
+        self.assertEqual(self.docs()["new"], ("parsing", A))
 
     def test_the_feed_carries_a_row_over_the_same_way(self):
         self.one_drive(file("a1", rev="7", md5="m1"))

@@ -267,6 +267,17 @@ def drive_walk(cx, acct, root):
     """Every file under `root` (breadth-first, paged). Returns (files, folders, complete)."""
     seen, files, queue, complete = {root}, {}, [root], True
     folders = {root}
+    if root == "root":
+        # "root" is Drive's alias for My Drive, but the changes feed names a file's parent by My Drive's real id, so
+        # without it a file saved straight into My Drive waited for the weekly walk (bebuilt, 2026-09-28: five).
+        try:
+            real = cx.run(acct, "GOOGLEDRIVE_GET_FILE_METADATA", {"fileId": "root", "fields": "id"})
+            real = (real.get("file") or real).get("id")
+            if real:
+                seen.add(real)
+                folders.add(real)
+        except Exception as e:
+            log(f"plan: could not resolve My Drive's id ({e}); files saved straight into it wait for the walk")
     fields = "nextPageToken,incompleteSearch,files(id,name,mimeType,size,modifiedTime,version,md5Checksum,webViewLink,shortcutDetails)"
     while queue:
         folder = queue.pop(0)
