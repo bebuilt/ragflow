@@ -30,14 +30,19 @@ A pass:
   0. reconcile  our records against everything RAGFlow holds: orphans deleted, finished parses indexed,
                 failed or stalled ones retried (it runs first, so a pass starts from what is actually there).
 """
+import csv
 import fcntl
+import io
 import json
 import mimetypes
 import os
+import re
 import sys
 import time
 import urllib.parse
-from datetime import datetime, timezone
+import zipfile
+from datetime import datetime, timedelta, timezone
+from xml.etree import ElementTree
 
 import psycopg
 import requests
@@ -365,6 +370,203 @@ def drive_download(cx, acct, f, acknowledged=False):
 
 class Skip(Exception):
     pass
+
+
+# --- Spreadsheets as rows ------------------------------------------------------------------------------
+# RAGFlow's own Excel parser packs rows into chunks as "header：value; …" with the tab name on the end, and nothing
+# says which file a row came from. A whole-dataset search then ranks any prose that repeats the building's name above
+# every row: Molzer's rent payments sat indexed in the "Operating Income/Deposits" tab of the Holtman Expense/Budget
+# Tracker while a search for Holtman rent payments returned only lease PDFs (2026-10-09). So a spreadsheet goes to
+# RAGFlow as text, one line per row, each line carrying the file's name, its tab and the column headers:
+#     Holtman Expense/Budget Tracker · Operating Income/Deposits · Date: 2026-10-06; Description: …; Amount: 2500
+# Standard library only (the worker-only update installs nothing). A file this can't read goes as before.
+SHEET_TEXT_LIMIT = 20 * 1024 * 1024  # bytes of text; a bigger workbook goes to RAGFlow's own parser
+SHEET_XML_LIMIT = 200 * 1024 * 1024  # uncompressed sheet XML read at most, so a zip bomb is refused, not read
+_NS = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+_REL = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+_BUILTIN_DATES = set(range(14, 23)) | set(range(27, 37)) | set(range(45, 48)) | set(range(50, 59))
+
+
+def _clean(v):
+    return re.sub(r"\s+", " ", str(v)).strip()
+
+
+def _number(text):
+    """A cell's stored number as a person reads it: whole numbers bare, money to the cent, small rates to four places.
+    The display format is not applied (124874.996667 is stored, $124,875.00 shown); rounding keeps the noise out."""
+    x = float(text)
+    if x.is_integer() and abs(x) < 1e15:
+        return str(int(x))
+    return f"{x:.{2 if abs(x) >= 100 else 4}f}".rstrip("0").rstrip(".")
+
+
+def _date_format(code):
+    code = re.sub(r'"[^"]*"|\[[^\]]*\]|\\.', "", code or "")
+    return bool(re.search(r"[dy]", code, re.I))
+
+
+def _col(ref):
+    n = 0
+    for ch in ref:
+        if not ch.isalpha():
+            break
+        n = n * 26 + ord(ch.upper()) - 64
+    return n - 1
+
+
+def _read(z, name):
+    info = z.getinfo(name)
+    if info.file_size > SHEET_XML_LIMIT:
+        raise ValueError(f"{name} is {info.file_size} bytes uncompressed")
+    return z.read(name)
+
+
+def xlsx_tabs(content):
+    """[(tab name, [[cell text, …], …])] for every sheet of an .xlsx, in workbook order. Dates come out as ISO dates."""
+    z = zipfile.ZipFile(io.BytesIO(content))
+    names = set(z.namelist())
+    wb = ElementTree.fromstring(_read(z, "xl/workbook.xml"))
+    pr = wb.find("m:workbookPr", _NS)
+    epoch = datetime(1904, 1, 1) if pr is not None and pr.get("date1904") in ("1", "true") else datetime(1899, 12, 30)
+    rels = ElementTree.fromstring(_read(z, "xl/_rels/workbook.xml.rels"))
+    target = {}
+    for r in rels:
+        t = r.get("Target", "")
+        target[r.get("Id")] = t.lstrip("/") if t.startswith("/") else "xl/" + t
+    shared = []
+    if "xl/sharedStrings.xml" in names:
+        for si in ElementTree.fromstring(_read(z, "xl/sharedStrings.xml")).findall("m:si", _NS):
+            # Plain text, or rich-text runs joined; phonetic guides (rPh) are not the text.
+            shared.append("".join(t.text or "" for t in si.findall("m:t", _NS) + si.findall("m:r/m:t", _NS)))
+    dates = set()
+    if "xl/styles.xml" in names:
+        st = ElementTree.fromstring(_read(z, "xl/styles.xml"))
+        custom = {int(f.get("numFmtId")): f.get("formatCode") for f in st.findall("m:numFmts/m:numFmt", _NS)}
+        for i, xf in enumerate(st.findall("m:cellXfs/m:xf", _NS)):
+            fid = int(xf.get("numFmtId", "0"))
+            if fid in _BUILTIN_DATES or (fid in custom and _date_format(custom[fid])):
+                dates.add(i)
+    tabs = []
+    for sh in wb.findall("m:sheets/m:sheet", _NS):
+        path = target.get(sh.get(_REL))
+        if not path or path not in names:
+            continue
+        rows = []
+        for row in ElementTree.fromstring(_read(z, path)).iterfind("m:sheetData/m:row", _NS):
+            cells, nxt = {}, 0
+            for c in row.findall("m:c", _NS):
+                i = _col(c.get("r")) if c.get("r") else nxt
+                nxt = i + 1
+                kind, v = c.get("t"), c.find("m:v", _NS)
+                if kind == "inlineStr":
+                    text = "".join(t.text or "" for t in c.iter(f"{{{_NS['m']}}}t"))
+                elif v is None or v.text is None:
+                    continue
+                elif kind == "s":
+                    text = shared[int(v.text)]
+                elif kind == "b":
+                    text = "TRUE" if v.text == "1" else "FALSE"
+                elif kind in ("str", "e"):
+                    text = "" if kind == "e" else v.text
+                else:
+                    try:
+                        if int(c.get("s", "0")) in dates:
+                            d = epoch + timedelta(days=float(v.text))
+                            text = d.strftime("%Y-%m-%d") if d.time() == datetime.min.time() else d.strftime("%Y-%m-%d %H:%M")
+                        else:
+                            text = _number(v.text)
+                    except (ValueError, OverflowError):
+                        text = v.text
+                text = _clean(text)
+                if text:
+                    cells[i] = text
+            if cells:
+                width = max(cells) + 1
+                rows.append([cells.get(i, "") for i in range(width)])
+        tabs.append((_clean(sh.get("name", "")), rows))
+    return tabs
+
+
+def csv_tabs(content):
+    try:
+        text = content.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = content.decode("latin-1")
+    rows = [[_clean(c) for c in r] for r in csv.reader(io.StringIO(text))]
+    return [("", [r for r in rows if any(r)])]
+
+
+def header_row(rows):
+    """Index of the column-header row among the first 20, or None: the first row with at least two cells, mostly text,
+    at least half as wide as the widest of the rows below it. Title rows above it ("Income/Deposits") are skipped."""
+    for i, r in enumerate(rows[:20]):
+        filled = [c for c in r if c]
+        if len(filled) < 2:
+            continue
+        below = [sum(1 for c in b if c) for b in rows[i + 1:i + 21]]
+        if below and len(filled) * 2 < max(below):
+            continue
+        texty = sum(1 for c in filled if not re.fullmatch(r"[-+$(]?[\d,.]+%?\)?|\d{4}-\d{2}-\d{2}( \d{2}:\d{2})?", c))
+        if texty * 2 >= len(filled):
+            return i
+    return None
+
+
+def sheet_text(display_name, tabs):
+    """The text RAGFlow indexes for a workbook: per tab, its title lines, then one line per row naming the file, the
+    tab and each value's column. Returns None for a workbook with no rows."""
+    out = []
+    name = _clean(display_name)
+    for tab, rows in tabs:
+        if not rows:
+            continue
+        where = f"{name} · {tab}" if tab else name
+        h = header_row(rows)
+        out.append(f"{where}")
+        if h is None:
+            out.extend(f"{where} · " + "; ".join(c for c in r if c) for r in rows)
+            continue
+        out.extend(f"{where} · " + " ".join(c for c in r if c) for r in rows[:h])
+        heads = rows[h]
+        for r in rows[h + 1:]:
+            filled = [i for i, c in enumerate(r) if c]
+            if len(filled) >= 2 and sum(1 for i in filled if i < len(heads) and r[i] == heads[i]) * 2 >= len(filled):
+                heads = r  # a block below repeats (or re-states) the headers: its own headers from here on
+                continue
+            pairs = []
+            for i, c in enumerate(r):
+                if c:
+                    head = heads[i] if i < len(heads) and heads[i] else ""
+                    pairs.append(f"{head}: {c}" if head else c)
+            if pairs:
+                out.append(f"{where} · " + "; ".join(pairs))
+        out.append("")
+    text = "\n".join(out).strip()
+    return text or None
+
+
+def as_sheet_text(display_name, filename, content):
+    """(filename, bytes) of a workbook's rows as text, or None to send the file itself (not a workbook this reads,
+    unreadable, empty, or too big)."""
+    low = filename.lower()
+    try:
+        if low.endswith(".xlsx"):
+            tabs = xlsx_tabs(content)
+        elif low.endswith(".csv"):
+            tabs = csv_tabs(content)
+        else:
+            return None
+        text = sheet_text(display_name, tabs)
+    except Exception as e:  # a workbook this reader can't follow still goes, to RAGFlow's own parser
+        log(f"send: {display_name}: read as rows failed ({e}); sending the file itself")
+        return None
+    if not text:
+        return None
+    data = text.encode("utf-8")
+    if len(data) > SHEET_TEXT_LIMIT:
+        log(f"send: {display_name}: {len(data)} bytes as rows; sending the file itself")
+        return None
+    return f"{filename}.txt", data
 
 
 # --- Dropbox ------------------------------------------------------------------------------------------
@@ -968,10 +1170,14 @@ def send(db, cx, org):
                     filename, content, extra = dropbox_download(cx, (user, account), namespaces[account], f)
             else:
                 (filename, content), extra = drive_download(cx, (user, account), f, acknowledged), {}
+            if parse == "native":
+                rows = as_sheet_text(name, filename, content)
+                if rows:
+                    (filename, content), parse = rows, "sheet-rows"
             if old_rf:
                 rag.delete([old_rf])
             rf = rag.upload(filename, content)
-            if parse != "native":
+            if parse in ("ocr", "plain", "onyx"):
                 rag.configure(rf, OCR if parse == "ocr" else PLAIN)
             rag.tag(rf, {"provider": provider, "external_id": ext_id, "revision": revision, "web_url": web_url or "",
                          "parse": parse, **extra})
