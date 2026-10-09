@@ -231,6 +231,105 @@ class _Expired:
         raise requests.HTTPError("403 Request has expired")
 
 
+def xlsx(sheets):
+    """A minimal .xlsx: [(tab, rows)], a row a list of str (shared string), number, ("date", serial) or None."""
+    import io
+    import zipfile
+    from xml.sax.saxutils import escape
+    strings, sheet_xml = [], []
+    for _, rows in sheets:
+        out = []
+        for ri, row in enumerate(rows, 1):
+            cells = []
+            for ci, v in enumerate(row):
+                ref = f"{chr(65 + ci)}{ri}"
+                if v is None:
+                    continue
+                if isinstance(v, tuple):
+                    cells.append(f'<c r="{ref}" s="1"><v>{v[1]}</v></c>')
+                elif isinstance(v, str):
+                    strings.append(v)
+                    cells.append(f'<c r="{ref}" t="s"><v>{len(strings) - 1}</v></c>')
+                else:
+                    cells.append(f'<c r="{ref}"><v>{v}</v></c>')
+            out.append(f'<row r="{ri}">{"".join(cells)}</row>')
+        sheet_xml.append(out)
+    ns = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("xl/workbook.xml", f'<workbook {ns}><sheets>' + "".join(
+            f'<sheet name="{escape(t)}" sheetId="{i}" r:id="rId{i}"/>' for i, (t, _) in enumerate(sheets, 1)) + "</sheets></workbook>")
+        z.writestr("xl/_rels/workbook.xml.rels", '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' + "".join(
+            f'<Relationship Id="rId{i}" Target="worksheets/sheet{i}.xml"/>' for i in range(1, len(sheets) + 1)) + "</Relationships>")
+        z.writestr("xl/sharedStrings.xml", f'<sst {ns}>' + "".join(f"<si><t>{escape(x)}</t></si>" for x in strings) + "</sst>")
+        z.writestr("xl/styles.xml", f'<styleSheet {ns}><cellXfs><xf numFmtId="0"/><xf numFmtId="14"/></cellXfs></styleSheet>')
+        for i, rows in enumerate(sheet_xml, 1):
+            z.writestr(f"xl/worksheets/sheet{i}.xml", f'<worksheet {ns}><sheetData>{"".join(rows)}</sheetData></worksheet>')
+    return buf.getvalue()
+
+
+# Molzer's tracker, cut down: a title row above the headers, a date column, money (2026-10-09).
+TRACKER_XLSX = xlsx([
+    ("Expense Tracker (ALL)", [["INVOICE TRACKER"], ["Invoice/Order #", "Date", "Invoice Name", "Amount"],
+                               ["00978933", ("d", 45806), "Intertek PSI", 2450]]),
+    ("Operating Income/Deposits", [["Income/Deposits"], ["#", "Date", "Description", "Amount"],
+                                   ["#0041", ("d", 46301), "Stephen Montez Unit #205 October Rent Payment", 2500.0],
+                                   ["#0042", ("d", 46301), "Bar Phoebe October 2026 Rent Payment #1", 7499.996667]]),
+])
+
+
+@unittest.skipUnless(ingest, "needs psycopg and requests")
+class SheetRowsTest(unittest.TestCase):
+    """A spreadsheet as RAGFlow indexes it: one line per row naming the file, the tab and each value's column."""
+
+    def setUp(self):
+        self.logged, self._log = [], ingest.log
+        ingest.log = lambda msg: self.logged.append(msg)
+
+    def tearDown(self):
+        ingest.log = self._log
+
+    def lines(self, name, filename, content):
+        out = ingest.as_sheet_text(name, filename, content)
+        self.assertIsNotNone(out)
+        self.assertEqual(out[0], f"{filename}.txt")
+        return out[1].decode().split("\n")
+
+    def test_every_row_names_the_file_and_tab_and_pairs_values_with_headers(self):
+        lines = self.lines("Holtman Expense/Budget Tracker", "Holtman Expense_Budget Tracker.xlsx", TRACKER_XLSX)
+        self.assertIn("Holtman Expense/Budget Tracker · Operating Income/Deposits · Income/Deposits", lines, "the title row stays, as a line")
+        self.assertIn("Holtman Expense/Budget Tracker · Operating Income/Deposits · #: #0041; Date: 2026-10-06; "
+                      "Description: Stephen Montez Unit #205 October Rent Payment; Amount: 2500", lines)
+        self.assertIn("Holtman Expense/Budget Tracker · Operating Income/Deposits · #: #0042; Date: 2026-10-06; "
+                      "Description: Bar Phoebe October 2026 Rent Payment #1; Amount: 7500", lines, "money to the cent")
+        self.assertIn("Holtman Expense/Budget Tracker · Expense Tracker (ALL) · Invoice/Order #: 00978933; Date: 2025-05-29; "
+                      "Invoice Name: Intertek PSI; Amount: 2450", lines)
+        self.assertFalse(any("Invoice/Order #: Invoice/Order #" in l for l in lines), "the header row is not a row")
+
+    def test_a_block_that_repeats_the_headers_starts_over_with_them(self):
+        book = xlsx([("2026", [["Tenant", "Suite", "Rent"], ["Woods", "8e", 1000],
+                               ["Tenant", "Suite", "Rent"], ["Corbin", "B5", 2000.5]])])
+        lines = self.lines("Ledge Rock Rent Roll", "rr.xlsx", book)
+        self.assertEqual([l for l in lines if "Suite:" in l], ["Ledge Rock Rent Roll · 2026 · Tenant: Woods; Suite: 8e; Rent: 1000",
+                                                               "Ledge Rock Rent Roll · 2026 · Tenant: Corbin; Suite: B5; Rent: 2000.5"])
+
+    def test_a_csv_has_no_tab(self):
+        lines = self.lines("Deposits", "deposits.csv", "﻿Date,Payer,Amount\n2026-10-06,Bar Phoebe,7500\n".encode())
+        self.assertIn("Deposits · Date: 2026-10-06; Payer: Bar Phoebe; Amount: 7500", lines)
+
+    def test_what_it_cannot_or_should_not_read_goes_as_the_file(self):
+        self.assertIsNone(ingest.as_sheet_text("Broken", "Broken.xlsx", b"not a zip"))
+        self.assertTrue(any("read as rows failed" in m for m in self.logged))
+        self.assertIsNone(ingest.as_sheet_text("Old", "Old.xls", b"\xd0\xcf\x11\xe0"), ".xls stays with RAGFlow's parser")
+        self.assertIsNone(ingest.as_sheet_text("Empty", "Empty.xlsx", xlsx([("Sheet1", [])])))
+        limit = ingest.SHEET_TEXT_LIMIT
+        try:
+            ingest.SHEET_TEXT_LIMIT = 10
+            self.assertIsNone(ingest.as_sheet_text("Big", "Big.xlsx", TRACKER_XLSX))
+        finally:
+            ingest.SHEET_TEXT_LIMIT = limit
+
+
 @unittest.skipUnless(DSN, "set INGEST_TEST_DSN to a throwaway Postgres")
 class IngestTest(unittest.TestCase):
     def setUp(self):
@@ -246,7 +345,7 @@ class IngestTest(unittest.TestCase):
         ingest.ONYX_EMPTY_FILE = os.path.join(self.tmp, "onyx-empty.json")
         self.logged, self._log = [], ingest.log
         ingest.log = lambda msg: (self.logged.append(msg), self._log(msg))
-        self.fetched, self.expired = [], set()
+        self.fetched, self.expired, self.bodies = [], set(), {}
         self._get = ingest.requests.get
         ingest.requests.get = self.fetch
         self.cx = FakeComposio()
@@ -262,7 +361,10 @@ class IngestTest(unittest.TestCase):
         if url in self.expired:
             self.expired.discard(url)
             return _Expired()
-        return _Resp()
+        r = _Resp()
+        if url in self.bodies:
+            r.content = self.bodies[url]
+        return r
 
     # --- fixture helpers ---
     def connect(self, cid, holder, user, account, status="ACTIVE", provider="googledrive"):
@@ -684,6 +786,26 @@ class IngestTest(unittest.TestCase):
                          ("skipped", "Dropbox can't export this file (non_exportable)"))
         self.assertNotIn("files/download", self.dbx.tails())
         self.assertEqual(self.dbx.tails().count("files/export"), 2)
+
+    def test_a_google_sheet_goes_to_ragflow_as_rows_naming_file_tab_and_headers(self):
+        self.connect(A, UA, "org-ask", "ca_a")
+        sheet = {**file("t1"), "name": "Holtman Expense/Budget Tracker", "mimeType": "application/vnd.google-apps.spreadsheet"}
+        broken = {**file("t2"), "name": "Broken.xlsx", "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
+        self.cx.drives["ca_a"] = {"FA": [sheet, broken]}
+        self.bodies["fake://ca_a/t1"] = TRACKER_XLSX
+        self.bodies["fake://ca_a/t2"] = b"not a zip"
+        self.tick("FA", A, UA)
+        self.run_pass()
+        rf = self.row("t1", "ragflow_doc_id")[0]
+        self.assertIn("Holtman Expense/Budget Tracker.xlsx.txt", self.rag.uploads)
+        text = self.rag.contents["Holtman Expense/Budget Tracker.xlsx.txt"].decode()
+        self.assertIn("Holtman Expense/Budget Tracker · Operating Income/Deposits · #: #0041; Date: 2026-10-06; "
+                      "Description: Stephen Montez Unit #205 October Rent Payment; Amount: 2500", text)
+        self.assertEqual(self.rag.tags[rf]["parse"], "sheet-rows")
+        self.assertNotIn(rf, self.rag.configs, "plain text needs no layout setting")
+        bad = self.row("t2", "ragflow_doc_id")[0]
+        self.assertIn("Broken.xlsx", self.rag.uploads, "a workbook the reader can't follow goes as itself")
+        self.assertEqual(self.rag.tags[bad]["parse"], "native")
 
     def test_dropbox_images_go_straight_to_ocr(self):
         self.connect(A, UA, "org-ask", "ca_x", provider="dropbox")

@@ -65,3 +65,15 @@ Rules this directory keeps:
   index, goes the usual way; a malformed index is one log line and the usual way for that pass. Text that parses to
   nothing sends the file itself once for that rev (`/var/lib/bebuilt/onyx-empty.json`). Each pass logs
   `send: N file(s) sent from Onyx text`.
+- **A spreadsheet is indexed as rows** (`.xlsx`, an exported Google Sheet, `.csv`). The worker reads the workbook itself
+  (standard library only) and uploads `<name>.txt`, one line per row: `<file name> · <tab> · <header>: <value>; …`, dates
+  as ISO dates, numbers to the cent, title rows above the headers kept as lines, a block that repeats the headers
+  starting over with them. Tagged `parse: sheet-rows`, parsed with the dataset's defaults; citations still open the
+  file. Why: RAGFlow's own Excel parser never puts the file's name on a row, so a whole-dataset search ranked lease
+  PDFs above every row of Molzer's rent-deposit tab (2026-10-09). A workbook it can't read (not a zip, `.xls`,
+  over 20 MB of text) goes as the file itself, `parse: native`, with one log line. Spreadsheets indexed before
+  this change keep RAGFlow's parse until their revision moves; to re-index them now, run in the client's Supabase:
+  `update documents set state = 'pending', attempts = 0, updated_at = now() where org_id = '<org>' and state = 'indexed'
+  and mime_type in ('application/vnd.google-apps.spreadsheet', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'text/csv');`
+  Each pass sends at most `BATCH` and waits while RAGFlow's queue is above `QUEUE_HIGH`, so a large re-queue drains
+  over several passes; a document is out of search between its old copy's delete and its new parse finishing.
